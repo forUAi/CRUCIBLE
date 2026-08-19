@@ -99,17 +99,56 @@ def plan(ev: Evidence, prefer: str = "auto") -> RunPlan:
             p = _from_dockerfile(ev)
             if p:
                 _merge_services(p, ev)
-                return p
+                return _finish(p)
         if "devcontainer" in ev.declared:
             p = _from_devcontainer(ev)
             if p:
                 _merge_services(p, ev)
-                return p
+                return _finish(p)
     p = _infer(ev)
     if "procfile" in ev.declared:
         _apply_procfile(p, ev)
     _merge_services(p, ev)
+    return _finish(p)
+
+
+def _finish(p: RunPlan) -> RunPlan:
+    """Invariants that hold whichever source produced the plan.
+
+    The dependency-port rule was implemented once, inside `_app_ports`, which
+    only the inference path calls. A Dockerfile saying `EXPOSE 6379` therefore
+    went straight through: the oracle probed the redis sidecar, got an answer,
+    and reported the app healthy while the app was dead. Same bug, different
+    door -- so the rule belongs on the way out, where all three doors meet.
+    """
+    _deconflict_ports(p)
     return p
+
+
+def _deconflict_ports(p: RunPlan) -> None:
+    """The oracle must never probe a port a sidecar we booted is holding."""
+    if not p.ports:
+        return
+    taken = {port for s in p.services for port in s.ports}
+    app = [x for x in p.ports if x not in taken and x not in SERVICE_PORTS]
+    if app == p.ports:
+        return
+
+    dropped = [x for x in p.ports if x not in app]
+    p.ports = app
+    p.note(f"dropped port(s) {dropped}: they belong to a dependency, not the app")
+
+    if p.oracle.get("kind") != "http":
+        return
+    if app:
+        p.oracle["port"] = app[0]
+    else:
+        # A web app whose only declared port belongs to a sidecar. We cannot
+        # probe anything honestly, so weaken the oracle to the strongest claim
+        # still supportable -- the process stayed up -- rather than passing on
+        # the sidecar's health. The lint reports this as unverifiable.
+        p.oracle = {"kind": "alive", "seconds": 20}
+        p.note("no app port survives; oracle weakened to liveness only")
 
 
 # ---------------------------------------------------------------------------
@@ -264,15 +303,18 @@ def _infer(ev: Evidence) -> RunPlan:
 
     # --- install ---
     if pm and pm in INSTALL:
-        cmd = INSTALL[pm]
+        cmd = _wrapped(INSTALL[pm], ev, pm)
         if pm == "pip" and "requirements.txt" not in ev.files:
             cmd = "pip install --no-cache-dir -e . || pip install --no-cache-dir ."
         p.steps.append(Step(f"install/{pm}", cmd, network=True, timeout=1800))
         p.note(f"package manager={pm} ({', '.join(ev.why('pkgmgr', pm)[:2])})")
+        if cmd.startswith("./"):
+            p.note(f"using the repo's own build wrapper ({cmd.split()[0]})")
 
     # --- build ---
     if pm in BUILD:
-        p.steps.append(Step(f"build/{pm}", BUILD[pm], network=True, timeout=1800))
+        p.steps.append(Step(f"build/{pm}", _wrapped(BUILD[pm], ev, pm),
+                            network=True, timeout=1800))
     elif lang == "node" and "build" in ev.scripts:
         # only build if a framework that needs it is present
         if fw in ("next", "nuxt", "vite", "remix", "astro", "nest"):
@@ -322,6 +364,7 @@ def _pick_run(ev: Evidence, lang: str, pm: str | None, fw: str | None) -> tuple[
 
     if fw and fw in FRAMEWORKS:
         arch, port, hint = FRAMEWORKS[fw]
+        port = _declared_port(ev, port)
         if fw == "django":
             return arch, port, "python manage.py migrate --noinput; python manage.py runserver 0.0.0.0:8000"
         if fw == "fastapi":
@@ -334,6 +377,13 @@ def _pick_run(ev: Evidence, lang: str, pm: str | None, fw: str | None) -> tuple[
             return arch, port, f"streamlit run {entry or 'app.py'} --server.address 0.0.0.0 --server.port {port}"
         if hint:
             return arch, port, hint
+        # No hint. The framework still told us the two things that matter --
+        # this is a web app, on this port -- and dropping that on the floor
+        # is how a Spring Boot service ends up classified `library` and
+        # "verified" by its own test suite. Synthesize a start command from
+        # the ecosystem; only if that fails do we fall through to heuristics.
+        if cmd := _synth_start(ev, lang, pm, fw, port):
+            return arch, port, cmd
 
     if lang == "node":
         for cand in ("start", "dev", "serve"):
@@ -369,6 +419,131 @@ def _test_cmd(lang: str, pm: str | None) -> str:
         "ruby": "bundle exec rspec || rake test", "java": "mvn -B test",
         "elixir": "mix test", "php": "vendor/bin/phpunit",
     }.get(lang, "make test")
+
+
+# ---------------------------------------------------------------------------
+# Start-command synthesis
+#
+# FRAMEWORKS carries a run hint for the handful of ecosystems whose start
+# command is a one-liner, and an empty string for everything else. An empty
+# hint used to mean "fall through", which quietly discarded the archetype and
+# port the framework had just told us -- so every JVM, Rails, Laravel and
+# Phoenix web service was filed as `library` and verified by running its
+# tests. The oracle then passed a repo whose server had never been started.
+#
+# These are the same one-liners, written down.
+# ---------------------------------------------------------------------------
+
+_WRAPPERS = {                       # pkgmgr -> (tool, wrapper script, trait)
+    "maven":  ("mvn", "mvnw", "maven-wrapper"),
+    "gradle": ("gradle", "gradlew", "gradle-wrapper"),
+}
+
+
+def _wrapped(cmd: str, ev: Evidence, pm: str | None) -> str:
+    """Prefer ./mvnw or ./gradlew when the repo ships one.
+
+    Not a style preference: `eclipse-temurin:*-jdk` contains a JDK and nothing
+    else -- no mvn, no gradle -- so the plain command is `not found` on the
+    base image we just chose for it. The wrapper is both the author's pinned
+    build-tool version and the only one that exists in the sandbox.
+    """
+    w = _WRAPPERS.get(pm or "")
+    if not w:
+        return cmd
+    tool, script, trait = w
+    if ev.has("trait", trait) and cmd.startswith(tool + " "):
+        return f"./{script}{cmd[len(tool):]}"
+    return cmd
+
+
+def _declared_port(ev: Evidence, default: int) -> int:
+    """An author-stated port beats a framework convention."""
+    if v := ev.top("jvm.port"):
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    return default
+
+
+def _jvm_jar(ev: Evidence, pm: str | None, fw: str | None) -> str:
+    """Where the build put the artifact.
+
+    Deterministic when the pom told us (`target/<artifactId>-<version>.jar`,
+    or <finalName> when overridden) so the emitted Dockerfile is reviewable;
+    a glob only when it didn't.
+    """
+    if fw == "quarkus" and pm == "maven":
+        return "target/quarkus-app/quarkus-run.jar"
+    if pm == "gradle":
+        # Gradle emits both boot.jar and boot-plain.jar; the plain one has no
+        # Main-Class and picking it fails with "no main manifest attribute".
+        return '"$(ls -1 build/libs/*.jar | grep -v -- -plain | head -1)"'
+    final = ev.top("jvm.finalname")
+    if final:
+        return f"target/{final}.jar"
+    art, ver = ev.top("jvm.artifact"), ev.top("jvm.version")
+    if art and ver:
+        return f"target/{art}-{ver}.jar"
+    return '"$(ls -1 target/*.jar | grep -v sources | head -1)"'
+
+
+def _jvm_start(ev: Evidence, pm: str | None, fw: str | None, port: int) -> str:
+    boot = fw in ("spring-boot", "quarkus", "micronaut")
+    if not boot and (mc := ev.top("jvm.mainclass")):
+        cp = "build/classes/java/main" if pm == "gradle" else "target/classes"
+        return f"java -cp {cp} {mc}"
+    jar = _jvm_jar(ev, pm, fw)
+    prop = f" --server.port={port}" if fw == "spring-boot" else ""
+    return f"java -jar {jar}{prop}"
+
+
+def _synth_start(ev: Evidence, lang: str, pm: str | None,
+                 fw: str | None, port: int) -> str | None:
+    entry = ev.entrypoints[0]["path"] if ev.entrypoints else ""
+
+    if lang in ("java", "kotlin", "scala"):
+        return _jvm_start(ev, pm, fw, port)
+
+    if lang == "ruby":
+        if fw == "rails":
+            return f"bundle exec rails server -b 0.0.0.0 -p {port}"
+        return f"bundle exec ruby {entry or 'app.rb'} -o 0.0.0.0 -p {port}"
+
+    if lang == "php":
+        if fw == "laravel":
+            return f"php artisan serve --host=0.0.0.0 --port={port}"
+        return f"php -S 0.0.0.0:{port} -t {'public' if 'public/index.php' in ev.files else '.'}"
+
+    if lang == "elixir":
+        return "mix phx.server" if fw == "phoenix" else None
+
+    if lang == "node":
+        for cand in ("start", "dev", "serve"):
+            if cand in ev.scripts:
+                return f"npm run {cand}"
+        if fw == "next":
+            return f"npx next start -p {port}"
+        if fw == "nuxt":
+            return "node .output/server/index.mjs"
+        if fw == "vite":
+            return f"npx vite preview --host 0.0.0.0 --port {port}"
+        return f"node {entry}" if entry else None
+
+    if lang == "python":
+        mod = _guess_module(ev)
+        if fw == "gunicorn":
+            return f"gunicorn {mod or 'app'}:app -b 0.0.0.0:{port}"
+        if fw == "uvicorn":
+            return f"uvicorn {mod or 'main'}:app --host 0.0.0.0 --port {port}"
+        return f"python {entry}" if entry else None
+
+    if lang == "go":
+        return "/tmp/app"
+    if lang == "rust":
+        return "cargo run --release"
+    return None
 
 
 def _guess_module(ev: Evidence) -> str | None:
@@ -415,3 +590,34 @@ def _merge_services(p: RunPlan, ev: Evidence) -> None:
         img, port, env = SERVICE_IMAGES[name]
         p.services.append(Service(name, img, [port], dict(env)))
         p.note(f"sidecar {name} ({img}) -- detected in source")
+    _wire_services(p, ev)
+
+
+# Spring reads connection settings from SPRING_* env vars, overriding whatever
+# application.properties says -- which is the only lever we have, since the
+# properties file is the repo's and points at the author's own database. A
+# sidecar nobody is told about is just a slower way to fail.
+_SPRING_WIRING = {
+    "postgres": {"SPRING_DATASOURCE_URL": "jdbc:postgresql://127.0.0.1:5432/crucible",
+                 "SPRING_DATASOURCE_USERNAME": "crucible",
+                 "SPRING_DATASOURCE_PASSWORD": "crucible"},
+    "mysql":    {"SPRING_DATASOURCE_URL": "jdbc:mysql://127.0.0.1:3306/crucible",
+                 "SPRING_DATASOURCE_USERNAME": "root",
+                 "SPRING_DATASOURCE_PASSWORD": "crucible"},
+    "redis":    {"SPRING_DATA_REDIS_HOST": "127.0.0.1",
+                 "SPRING_DATA_REDIS_PORT": "6379"},
+    "mongodb":  {"SPRING_DATA_MONGODB_URI": "mongodb://127.0.0.1:27017/crucible"},
+    "kafka":    {"SPRING_KAFKA_BOOTSTRAP_SERVERS": "127.0.0.1:9092"},
+    "rabbitmq": {"SPRING_RABBITMQ_HOST": "127.0.0.1"},
+}
+
+
+def _wire_services(p: RunPlan, ev: Evidence) -> None:
+    """Point the app at the sidecars we just booted."""
+    if not p.services:
+        return
+    if ev.top("framework") in ("spring-boot",) or ev.has("framework", "spring-boot"):
+        for svc in p.services:
+            for k, v in _SPRING_WIRING.get(svc.name, {}).items():
+                p.env.setdefault(k, v)
+        p.note(f"wired {len(p.services)} sidecar(s) into SPRING_* env")

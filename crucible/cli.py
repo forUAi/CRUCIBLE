@@ -10,6 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from . import lint as lint_mod
 from . import materialize
 from .engine import Engine
 from .evidence import collect
@@ -63,6 +64,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--no-llm", action="store_true", help="deterministic repairs only")
     ap.add_argument("--plan-only", action="store_true", help="analyze and print, do not execute")
+    ap.add_argument("--lint-strict", action="store_true",
+                    help="exit non-zero if the plan contradicts its own evidence")
     ap.add_argument("--emit", metavar="DIR", help="write Dockerfile/compose/lock here")
     a = ap.parse_args(argv)
 
@@ -93,9 +96,10 @@ def main(argv=None) -> int:
         print(f"  oracle    {p.oracle}")
         for s in p.services:
             print(f"  sidecar   {s.name} -> {s.image}")
+        bad = _print_lint(p, ev)
         if a.emit:
             _emit(a.emit, p, ev.fingerprint(), [], None)
-        return 0
+        return 2 if (bad and a.lint_strict) else 0
 
     eng = Engine(budget=a.budget, mem_mb=a.mem, run_offline=not a.online_run,
                  use_cache=not a.no_cache, llm=None if a.no_llm else _llm_from_env())
@@ -122,6 +126,18 @@ def main(argv=None) -> int:
     if a.emit:
         _emit(a.emit, out.plan, out.evidence_fp, out.attempts, out.ledger)
     return 0 if out.ok else 1
+
+
+def _print_lint(plan, ev) -> int:
+    """Check the plan against its own evidence before anything is executed."""
+    findings = lint_mod.lint(plan, ev)
+    print("\n\033[1mplan lint\033[0m")
+    if not findings:
+        print("  \033[32mno contradictions\033[0m")
+        return 0
+    for f in findings:
+        print(f"  \033[{'31' if f.severity == 'error' else '33'}m{f}\033[0m")
+    return len(lint_mod.errors(findings))
 
 
 def _rebase(p, base):

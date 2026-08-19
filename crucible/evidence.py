@@ -142,6 +142,8 @@ FRAMEWORKS = {
     "actix-web": ("web", 8080, ""),
     "rocket":    ("web", 8000, ""),
     "spring-boot": ("web", 8080, ""),
+    "quarkus":   ("web", 8080, ""),
+    "micronaut": ("web", 8080, ""),
     "phoenix":   ("web", 4000, ""),
     "laravel":   ("web", 8000, ""),
     "streamlit": ("web", 8501, "streamlit run {entry} --server.address 0.0.0.0"),
@@ -248,6 +250,7 @@ def collect(root: str) -> Evidence:
     _parse_python(rootp, ev)
     _parse_go(rootp, ev)
     _parse_cargo(rootp, ev)
+    _parse_jvm(rootp, ev)
 
     # ---- 6. content grep: services, native deps, ports, frameworks ------
     grep_budget = 900
@@ -280,7 +283,8 @@ def collect(root: str) -> Evidence:
         "gin-gonic": "go", "fiber": "go", "echo": "go",
         "axum": "rust", "actix-web": "rust", "rocket": "rust",
         "rails": "ruby", "sinatra": "ruby", "laravel": "php",
-        "spring-boot": "java", "phoenix": "elixir",
+        "spring-boot": "java", "quarkus": "java", "micronaut": "java",
+        "phoenix": "elixir",
     }
     present = {v for v, w in ev.tally("language") if w >= 0.35}
     for fw in FRAMEWORKS:
@@ -383,6 +387,217 @@ def _parse_cargo(root: Path, ev: Evidence) -> None:
     for fw in ("axum", "actix-web", "rocket", "warp", "tokio"):
         if re.search(rf"^{re.escape(fw)}\s*=", txt, re.M):
             ev.signals.append(Signal("framework", fw, 0.9, "Cargo.toml"))
+
+
+# ---------------------------------------------------------------------------
+# JVM
+#
+# Java is the ecosystem where a corpus grep is least defensible. A pom is XML
+# with the exact answers in it -- artifact, version, packaging, JDK release,
+# every dependency -- and the run command literally cannot be synthesized
+# without them, because the thing you run is a jar whose filename is
+# <artifactId>-<version>.jar. Every other language here has a structured
+# parser; this is the one that was missing.
+#
+# Facts land as signals under dotted kinds ("jvm.artifact") so they flow
+# through Evidence.top()/why() like everything else and stay attributable to
+# the file that produced them.
+# ---------------------------------------------------------------------------
+
+# JDBC and Spring property names for services. The generic SERVICE_PATTERNS
+# above are written for driver imports (`psycopg2`, `ioredis`); the JVM names
+# its dependencies in XML and its endpoints in a URL scheme nothing else uses.
+JVM_SERVICE_PATTERNS = [
+    (r"jdbc:postgresql:|\bpostgresql\b.*<scope>|org\.postgresql|r2dbc:postgresql:", "postgres"),
+    (r"jdbc:mysql:|com\.mysql|mysql-connector", "mysql"),
+    (r"jdbc:mariadb:|org\.mariadb", "mysql"),
+    (r"spring\.data\.mongodb|mongodb://|mongodb-driver", "mongodb"),
+    (r"spring\.data\.redis|spring\.redis\.|\b(lettuce|jedis)\b|redis://", "redis"),
+    (r"spring\.kafka|\bkafka-clients\b", "kafka"),
+    (r"spring\.rabbitmq|\bamqp-client\b", "rabbitmq"),
+    (r"spring\.elasticsearch|elasticsearch-java|opensearch-rest", "elasticsearch"),
+]
+
+
+def _strip_ns(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _flatten_yaml(txt: str) -> str:
+    """Indent-based flatten of simple YAML to dotted keys.
+
+    Spring accepts the same settings as `application.properties`
+    (`spring.data.redis.host=x`) or as nested `application.yml`, and real
+    repos use both. Everything downstream matches dotted names, so a nested
+    file was invisible -- a redis dependency stated in YAML produced no
+    sidecar at all.
+
+    Deliberately not a YAML parser: no anchors, lists, flow mappings or
+    multi-line scalars. It turns nesting into dotted paths and stops there,
+    because that is the only thing being asked of it.
+    """
+    out: list[str] = []
+    stack: list[tuple[int, str]] = []
+    for raw in txt.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "- ", "---")) or ":" not in line:
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        key, _, val = line.partition(":")
+        key, val = key.strip().strip("'\""), val.strip()
+        if not key:
+            continue
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        path = ".".join([k for _, k in stack] + [key])
+        if val:
+            out.append(f"{path}={val}")
+        else:
+            stack.append((indent, key))
+    return "\n".join(out)
+
+
+def _parse_jvm(root: Path, ev: Evidence) -> None:
+    poms = [f for f in ev.files if f.endswith("pom.xml") and f.count("/") <= 3]
+    gradles = [f for f in ev.files
+               if f.rsplit("/", 1)[-1] in ("build.gradle", "build.gradle.kts")
+               and f.count("/") <= 3]
+    props = [f for f in ev.files
+             if re.search(r"(^|/)application(-[\w]+)?\.(properties|ya?ml)$", f)]
+    if not (poms or gradles or props):
+        return
+
+    add = ev.signals.append
+    jvm_corpus: list[str] = []
+
+    # ---- wrappers ------------------------------------------------------
+    # A repo shipping mvnw/gradlew has pinned its build tool on purpose, and
+    # the base JDK images carry neither `mvn` nor `gradle`. Using the wrapper
+    # is both the author's intent and the only thing that works unaided.
+    if "mvnw" in ev.files:
+        add(Signal("trait", "maven-wrapper", 0.99, "mvnw"))
+    if "gradlew" in ev.files:
+        add(Signal("trait", "gradle-wrapper", 0.99, "gradlew"))
+
+    # ---- pom.xml -------------------------------------------------------
+    for rel in sorted(poms, key=lambda f: f.count("/")):
+        txt = _read(root / rel, 400_000)
+        jvm_corpus.append(txt)
+        if "<!ENTITY" in txt:      # entity-expansion bomb; the grep still applies
+            continue
+        try:
+            import xml.etree.ElementTree as ET
+            proj = ET.fromstring(txt)
+        except Exception:
+            continue
+
+        kids = {_strip_ns(c.tag): c for c in proj}
+        root_pom = rel.count("/") == 0
+
+        # Multi-module reactor: record members, mirroring the npm/cargo path.
+        mods = kids.get("modules")
+        if mods is not None:
+            for m in mods:
+                if m.text:
+                    ev.workspaces.append(m.text.strip())
+
+        if root_pom:
+            for key, kind in (("artifactId", "jvm.artifact"), ("version", "jvm.version"),
+                              ("packaging", "jvm.packaging")):
+                el = kids.get(key)
+                if el is not None and el.text:
+                    add(Signal(kind, el.text.strip(), 0.99, rel))
+
+            build = kids.get("build")
+            if build is not None:
+                for c in build:
+                    if _strip_ns(c.tag) == "finalName" and c.text:
+                        add(Signal("jvm.finalname", c.text.strip(), 0.99, rel))
+
+            # JDK release: several spellings, all authoritative.
+            p = kids.get("properties")
+            if p is not None:
+                for c in p:
+                    name, val = _strip_ns(c.tag), (c.text or "").strip()
+                    if name in ("java.version", "maven.compiler.release",
+                                "maven.compiler.source", "kotlin.jvm.target") and val:
+                        add(Signal("runtime", f"java:{val.lstrip('1.')}", 0.97, rel))
+
+        parent = kids.get("parent")
+        if parent is not None:
+            pa = {_strip_ns(c.tag): (c.text or "").strip() for c in parent}
+            if pa.get("artifactId") == "spring-boot-starter-parent":
+                add(Signal("framework", "spring-boot", 0.99, rel))
+
+        deps = kids.get("dependencies")
+        if deps is not None:
+            for d in deps:
+                dd = {_strip_ns(c.tag): (c.text or "").strip() for c in d}
+                aid, gid = dd.get("artifactId", ""), dd.get("groupId", "")
+                if aid.startswith("spring-boot-starter"):
+                    add(Signal("framework", "spring-boot", 0.99, rel))
+                if aid == "spring-boot-starter-web" or aid == "spring-boot-starter-webflux":
+                    add(Signal("trait", "jvm-http-server", 0.99, rel))
+                if gid == "io.quarkus":
+                    add(Signal("framework", "quarkus", 0.99, rel))
+                if gid.startswith("io.micronaut"):
+                    add(Signal("framework", "micronaut", 0.99, rel))
+
+        plugins = txt
+        if "spring-boot-maven-plugin" in plugins:
+            add(Signal("trait", "spring-boot-repackage", 0.99, rel))
+
+    # ---- gradle --------------------------------------------------------
+    for rel in sorted(gradles, key=lambda f: f.count("/")):
+        txt = _read(root / rel, 200_000)
+        jvm_corpus.append(txt)
+        if re.search(r"org\.springframework\.boot|spring-boot-starter", txt):
+            add(Signal("framework", "spring-boot", 0.97, rel))
+        if "spring-boot-starter-web" in txt:
+            add(Signal("trait", "jvm-http-server", 0.97, rel))
+        if "io.quarkus" in txt:
+            add(Signal("framework", "quarkus", 0.97, rel))
+        if "io.micronaut" in txt:
+            add(Signal("framework", "micronaut", 0.97, rel))
+        if m := re.search(r"languageVersion\s*[=.]\s*JavaLanguageVersion\.of\((\d+)\)", txt):
+            add(Signal("runtime", f"java:{m.group(1)}", 0.97, rel))
+        elif m := re.search(r"(?:sourceCompatibility|targetCompatibility)\s*=\s*['\"]?(?:1\.)?(\d+)", txt):
+            add(Signal("runtime", f"java:{m.group(1)}", 0.95, rel))
+        if m := re.search(r"""mainClass(?:Name)?\s*[=.]\s*['"]([\w.$]+)['"]""", txt):
+            add(Signal("jvm.mainclass", m.group(1), 0.97, rel))
+        if m := re.search(r"""^\s*(?:archivesBaseName|rootProject\.name)\s*=\s*['"]([\w.\-]+)['"]""",
+                          txt, re.M):
+            add(Signal("jvm.artifact", m.group(1), 0.9, rel))
+        if m := re.search(r"""^\s*version\s*=\s*['"]([\w.\-]+)['"]""", txt, re.M):
+            add(Signal("jvm.version", m.group(1), 0.9, rel))
+
+    if "settings.gradle" in ev.files or "settings.gradle.kts" in ev.files:
+        s = _read(root / ("settings.gradle" if "settings.gradle" in ev.files
+                          else "settings.gradle.kts"), 40_000)
+        for m in re.finditer(r"""include\s*\(?\s*['"]:?([\w.\-:]+)['"]""", s):
+            ev.workspaces.append(m.group(1).replace(":", "/"))
+        if m := re.search(r"""rootProject\.name\s*=\s*['"]([\w.\-]+)['"]""", s):
+            add(Signal("jvm.artifact", m.group(1), 0.92, "settings.gradle"))
+
+    # ---- application.properties / application.yml ----------------------
+    # The app's own port, stated by the author. Without this a Spring service
+    # is probed on 8080 by convention and a repo that moved it looks dead.
+    for rel in sorted(props, key=lambda f: f.count("/")):
+        txt = _read(root / rel, 80_000)
+        # Flatten YAML so both spellings reach the same matchers.
+        if rel.endswith((".yml", ".yaml")):
+            txt = txt + "\n" + _flatten_yaml(txt)
+        jvm_corpus.append(txt)
+        if m := re.search(r"^\s*server\.port\s*[=:]\s*['\"]?(\d{2,5})", txt, re.M):
+            add(Signal("jvm.port", m.group(1), 0.99, rel))
+        if m := re.search(r"^\s*spring\.application\.name\s*[=:]\s*(\S+)", txt, re.M):
+            add(Signal("jvm.appname", m.group(1).strip("'\""), 0.8, rel))
+
+    # ---- services, from JVM-shaped evidence ----------------------------
+    blob = "\n".join(jvm_corpus)
+    for pat, svc in JVM_SERVICE_PATTERNS:
+        if re.search(pat, blob, re.I):
+            add(Signal("service", svc, 0.85, "<jvm manifests>"))
 
 
 # ---------------------------------------------------------------------------

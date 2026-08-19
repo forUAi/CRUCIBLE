@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import evidence as ev_mod
+from . import lint as lint_mod
 from . import planner as planner_mod
 from . import repair as repair_mod
 from .backends.namespace import NamespaceBackend
@@ -83,6 +84,22 @@ class Engine:
 
     # ------------------------------------------------------------------
 
+    def _lint(self, plan: RunPlan, ev: Evidence) -> None:
+        """Check the plan against its own evidence before building a sandbox.
+
+        Costs microseconds; the attempt it can save costs tens of seconds. An
+        `error` here means the plan cannot verify what it claims to verify, so
+        executing it would produce a result that is evidence of nothing.
+        Recorded on the plan so it survives into crucible.lock.json.
+        """
+        findings = lint_mod.lint(plan, ev)
+        if not findings:
+            return
+        self.log("\n\033[1m\u25b8 plan lint\033[0m")
+        for f in findings:
+            self.log(f"  \033[{'31' if f.severity == 'error' else '33'}m{f}\033[0m")
+            plan.note(f"lint/{f.severity}: {f.code} -- {f.detail}")
+
     def run(self, repo: str, prefer: str = "auto") -> Outcome:
         t0 = time.time()
         self.log(f"\n\033[1m▸ evidence\033[0m  {repo}")
@@ -95,6 +112,7 @@ class Engine:
         dns.start()
 
         plan, cache_hit = self._seed_plan(ev, efp, prefer)
+        self._lint(plan, ev)
         box = self.backend_cls(f"box-{uuid.uuid4().hex[:8]}", log=self.log, mem_mb=self.mem_mb)
         box.dns = dns
 

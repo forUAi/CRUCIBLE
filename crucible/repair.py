@@ -55,6 +55,11 @@ CMD_TO_APT = {
     "tar": "tar", "xz": "xz-utils", "bzip2": "bzip2", "patch": "patch",
     "autoconf": "autoconf", "libtool": "libtool", "gfortran": "gfortran",
     "java": "default-jre", "node": "nodejs", "rustc": "rustc", "cargo": "cargo",
+    # The JDK base images ship a JDK and nothing else -- no build tool at all,
+    # so `mvn`/`gradle` are `not found` on the very base the planner picks for
+    # a Java repo. Without these two entries that failure has no rule and the
+    # run is abandoned as unrepairable.
+    "mvn": "maven", "gradle": "gradle",
 }
 
 SO_TO_APT = {
@@ -257,6 +262,84 @@ def _r_javaver(m, plan, step):
     jdk = {61: 17, 65: 21, 55: 11, 52: 8}.get(n, 21)
     return Patch(f"bytecode target {n} -> rebase to temurin {jdk}", 0.8,
                  lambda p: setattr(p, "base", f"eclipse-temurin:{jdk}-jdk"), tags=["rebase"])
+
+
+@rule(r"no main manifest attribute, in ([\w/.\-]+\.jar)")
+def _r_jar_nomain(m, plan, step):
+    """`mvn package` produced a plain jar, not an executable one.
+
+    Means the boot repackage goal never ran. Handing the build tool the run
+    is the reliable fix -- it resolves the main class from the project model
+    instead of the manifest.
+    """
+    tool = "./mvnw" if any("./mvnw" in s.cmd for s in plan.steps) else "mvn"
+    if any("gradle" in s.cmd for s in plan.steps):
+        tool = "./gradlew" if any("./gradlew" in s.cmd for s in plan.steps) else "gradle"
+        run = f"{tool} --no-daemon bootRun"
+    else:
+        run = f"{tool} -B spring-boot:run"
+    return Patch(f"{m.group(1)} has no Main-Class -> start via {tool}", 0.85,
+                 lambda p: setattr(p, "run", run), tags=["jvm"])
+
+
+@rule(r"Could not find or load main class ([\w.$]+)")
+def _r_jvm_mainclass(m, plan, step):
+    cls = m.group(1)
+    return Patch(f"main class {cls} not on classpath -> run from the built jar", 0.7,
+                 lambda p: setattr(p, "run", 'java -jar "$(ls -1 target/*.jar '
+                                             'build/libs/*.jar 2>/dev/null | '
+                                             'grep -v -- -plain | head -1)"'),
+                 tags=["jvm"])
+
+
+@rule(r"Failed to configure a DataSource|'url' attribute is not specified and no embedded datasource")
+def _r_spring_datasource(m, plan, step):
+    """Spring refuses to start without a database it was told to expect.
+
+    Distinct from a refused connection: nothing is listening *and* nothing was
+    configured, so the sidecar alone is not enough -- the app needs the URL.
+    """
+    def fix(p):
+        _add_service(p, "postgres")
+        p.env.setdefault("SPRING_DATASOURCE_URL",
+                         "jdbc:postgresql://127.0.0.1:5432/crucible")
+        p.env.setdefault("SPRING_DATASOURCE_USERNAME", "crucible")
+        p.env.setdefault("SPRING_DATASOURCE_PASSWORD", "crucible")
+    return Patch("Spring DataSource unconfigured -> postgres sidecar + JDBC url",
+                 0.9, fix, tags=["services", "jvm"])
+
+
+@rule(r"Web server failed to start\. Port (\d{2,5}) was already in use")
+def _r_spring_port(m, plan, step):
+    return Patch(f"Spring port {m.group(1)} taken -> shift to a free port", 0.95,
+                 _shift_port, tags=["runtime", "jvm"])
+
+
+@rule(r"(?:Could not resolve dependencies|Non-resolvable parent POM|"
+      r"Could not resolve all (?:files|dependencies) for configuration)")
+def _r_jvm_offline(m, plan, step):
+    """Maven/Gradle could not reach the registry. The build steps already run
+    with network=True, so the useful move is to stop failing on a partially
+    warmed cache and let the package step fetch what it needs."""
+    def fix(p):
+        for s in p.steps:
+            if s.name.startswith("install/") and ("mvn" in s.cmd or "gradle" in s.cmd):
+                s.allow_fail = True
+            if "mvn" in s.cmd or "gradle" in s.cmd:
+                s.network = True
+    return Patch("dependency resolution failed -> defer to the package step",
+                 0.6, fix, tags=["jvm", "network"])
+
+
+@rule(r"Could not create the Java Virtual Machine|"
+      r"java\.lang\.OutOfMemoryError|GC overhead limit exceeded")
+def _r_jvm_heap(m, plan, step):
+    return Patch("JVM out of heap -> cap the toolchain and daemon heap", 0.8,
+                 lambda p: p.env.update({
+                     "JAVA_TOOL_OPTIONS": "-Xmx1g -XX:MaxMetaspaceSize=256m",
+                     "GRADLE_OPTS": "-Dorg.gradle.jvmargs=-Xmx1g -Dorg.gradle.daemon=false",
+                     "MAVEN_OPTS": "-Xmx1g",
+                 }), tags=["jvm", "resources"])
 
 
 # --- runtime / connectivity -------------------------------------------------
