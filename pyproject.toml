@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crucible"
+version = "0.1.0"
+description = "Give it a repo. It figures out how to run it, in a sandbox, and writes down what it learned."
+requires-python = ">=3.11"
+dependencies = []          # stdlib only, deliberately
+
+[project.scripts]
+crucible = "crucible.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["crucible*"]

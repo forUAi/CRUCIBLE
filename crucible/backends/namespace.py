@@ -1,0 +1,542 @@
+"""
+CRUCIBLE :: backends/namespace.py
+
+A container runtime built from the primitives Docker itself uses, with no
+daemon and no Docker binary:
+
+    mount namespace  + overlayfs   -> filesystem isolation AND free snapshots
+    pid namespace                  -> process isolation
+    net namespace (optional)       -> the build/run network split
+    uts + ipc namespaces           -> hostname / shm isolation
+    cgroups                        -> cpu + memory + pid caps
+    rlimits                        -> fd / fsize / core caps
+
+Two overlays are stacked, and the second one is the important one:
+
+    /            lower = base rootfs      upper = layers/NNN/root
+    /workspace   lower = the user's repo  upper = layers/NNN/ws
+
+Overlaying the *workspace* means the repo gets copy-on-write for free. The
+sandbox can `rm -rf`, `git reset --hard`, or npm-install into it and the
+user's actual source tree is never touched. Rewinding a failed attempt is an
+unmount, not a restore-from-backup.
+
+SNAPSHOT MODEL
+    layers/000-<key>/{root,ws,work-root,work-ws}
+    layers/001-<key>/...
+    live/{root,ws,work-root,work-ws}      <- current writable head
+
+    snapshot(key): unmount -> rename live/ to layers/NNN-key/ -> fresh live
+    restore(key):  unmount -> rebuild lowerdir chain up to key -> fresh live
+
+Cost of a snapshot is a directory rename. That is the entire reason the
+repair loop is affordable.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import subprocess
+import time
+from pathlib import Path
+from typing import Optional
+
+from ..schema import ExecResult, Step
+from .base import SandboxBackend
+
+STATE_ROOT = Path(os.environ.get("CRUCIBLE_STATE", "/var/lib/crucible"))
+
+
+def _sh(cmd: str, check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, check=check)
+
+
+_STORE_READY = False
+
+
+def ensure_private_store(size_mb: int = 4096, log=print) -> None:
+    """Give the layer store its own filesystem. Non-negotiable, and subtle.
+
+    overlayfs refuses to mount when one layer is an ancestor of another --
+    it walks dentry parents looking for "traps" and returns ELOOP. Using the
+    host rootfs `/` as the read-only lower means our snapshot directories,
+    living under /var/lib/crucible, are inside a lower layer. The first mount
+    survives; the second (after a snapshot adds `/` alongside a layer dir)
+    dies with the memorably unhelpful "Too many levels of symbolic links".
+
+    dentry-parent walks do not cross mount points. So mounting *any* separate
+    filesystem at the store path severs the ancestry chain and the whole class
+    of error disappears. Disk-backed loop image preferred (builds are large
+    and RAM here is not); tmpfs as fallback.
+    """
+    global _STORE_READY
+    if _STORE_READY:
+        return
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    if _sh(f"mountpoint -q {STATE_ROOT}").returncode == 0:
+        _STORE_READY = True
+        return
+
+    img = STATE_ROOT.parent / "crucible-store.img"
+    have_loop = shutil.which("losetup") and shutil.which("mkfs.ext4")
+    if have_loop:
+        try:
+            if not img.exists():
+                _sh(f"truncate -s {size_mb}M {img}")
+                _sh(f"mkfs.ext4 -q -F {img}")
+            if _sh(f"mount -o loop {img} {STATE_ROOT}").returncode == 0:
+                log(f"  store: ext4 loop image ({size_mb} MB) at {STATE_ROOT}")
+                _STORE_READY = True
+                return
+        except OSError:
+            pass
+
+    if _sh(f"mount -t tmpfs -o size={size_mb}m tmpfs {STATE_ROOT}").returncode == 0:
+        log(f"  store: tmpfs ({size_mb} MB) at {STATE_ROOT}")
+        _STORE_READY = True
+    else:
+        log("  ! could not create a private store -- snapshots may fail on host base")
+
+
+class NamespaceBackend(SandboxBackend):
+    name = "namespace"
+    supports_snapshots = True
+
+    def __init__(self, box_id: str, log=print, mem_mb: int = 2048,
+                 cpu_pct: int = 100, pid_max: int = 512, store_mb: int = 4096):
+        self.id = box_id
+        self.log = log
+        self.mem_mb, self.cpu_pct, self.pid_max = mem_mb, cpu_pct, pid_max
+        self.store_mb = store_mb
+        self.dir = STATE_ROOT / box_id
+        self.base_dir = self.dir / "base"
+        # Layers are content-addressed by CHAIN hash and shared across boxes and
+        # across runs, so a step proven good once is never re-executed. Keying
+        # on the step alone would be wrong: the filesystem a step produces
+        # depends on the base image and every step beneath it, so `pip install
+        # -r requirements.txt` under python:3.11 and under node:22 are
+        # different layers that happen to share a command string.
+        self.layers_dir = STATE_ROOT / "layers"
+        self.live = self.dir / "live"
+        self.merged = self.dir / "merged"
+        self.repo: Optional[Path] = None
+        self.stack: list[str] = []          # ordered snapshot keys, oldest first
+        self.pod = None                     # optional shared-netns Pod
+        self.dns = None                     # optional DnsLedger
+        self.peers: dict = {}               # (ip, port) -> first seen
+        self._mounted = False
+        self._cg: list[Path] = []
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+
+    def up(self, base: str, repo_path: str, system_packages: list[str]) -> None:
+        self.repo = Path(repo_path).resolve()
+        for d in (self.layers_dir, self.merged):
+            d.mkdir(parents=True, exist_ok=True)
+
+        if base in ("host", "", None):
+            # Fastest path: the host rootfs is the read-only lower layer.
+            # Everything the host has (compilers, apt, python) is available,
+            # but every write lands in the overlay. Zero-cost "image pull".
+            # Requires the layer store to be its own mount -- see the function.
+            ensure_private_store(self.store_mb, self.log)
+            self.base_dir = Path("/")
+            self.log(f"  base: host rootfs (read-only lower)")
+        else:
+            from ..oci import pull_rootfs
+            cache = STATE_ROOT / "images" / base.replace("/", "_").replace(":", "_")
+            self.log(f"  base: pulling {base}")
+            pull_rootfs(base, str(cache), log=self.log)
+            self.base_dir = cache
+
+        self._fresh_live()
+        self._mount()
+        self._cgroup_setup()
+        if system_packages:
+            self._install_system(system_packages)
+
+    def down(self) -> None:
+        self._umount()
+        self._cgroup_teardown()
+
+    def destroy(self) -> None:
+        self.down()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # overlay plumbing
+    # ------------------------------------------------------------------
+
+    def _fresh_live(self) -> None:
+        shutil.rmtree(self.live, ignore_errors=True)
+        for sub in ("root", "ws", "work-root", "work-ws"):
+            (self.live / sub).mkdir(parents=True, exist_ok=True)
+
+    def _lower_chain(self, sub: str, floor: Path) -> str:
+        """overlayfs lowerdir order is highest-priority-first."""
+        parts = [str(self.layers_dir / k / sub) for k in reversed(self.stack)]
+        parts.append(str(floor))
+        return ":".join(p for p in parts if Path(p).exists())
+
+    def _mount(self) -> None:
+        if self._mounted:
+            return
+        self.merged.mkdir(parents=True, exist_ok=True)
+        r = _sh(
+            f"mount -t overlay crucible-{self.id} -o "
+            f"lowerdir={self._lower_chain('root', self.base_dir)},"
+            f"upperdir={self.live}/root,workdir={self.live}/work-root "
+            f"{self.merged}"
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"rootfs overlay failed: {r.stderr.strip()}")
+
+        ws = self.merged / "workspace"
+        ws.mkdir(parents=True, exist_ok=True)
+        r = _sh(
+            f"mount -t overlay crucible-{self.id}-ws -o "
+            f"lowerdir={self._lower_chain('ws', self.repo)},"
+            f"upperdir={self.live}/ws,workdir={self.live}/work-ws {ws}"
+        )
+        if r.returncode != 0:
+            # degrade to a read-only bind rather than dying
+            _sh(f"mount --bind {self.repo} {ws} && mount -o remount,ro,bind {ws}")
+            self.log("  ! workspace COW unavailable, mounted read-only")
+
+        for d in ("proc", "sys", "dev", "tmp", "run"):
+            (self.merged / d).mkdir(parents=True, exist_ok=True)
+        from ..pod import populate_dev
+        populate_dev(self.merged)
+        # DNS for network-enabled steps. When a ledger is attached, point the
+        # sandbox at it instead of the real resolver so every name the build
+        # looks up is recorded on the way through.
+        try:
+            (self.merged / "etc").mkdir(parents=True, exist_ok=True)
+            if self.dns is not None and self.dns.active:
+                (self.merged / "etc/resolv.conf").write_text(
+                    f"nameserver {self.dns.bind}\noptions timeout:3\n")
+            else:
+                shutil.copy("/etc/resolv.conf", self.merged / "etc/resolv.conf")
+        except OSError:
+            pass
+
+        # Propagate the host CA trust store into the sandbox.
+        #
+        # Corporate and CI networks routinely terminate TLS at an egress proxy
+        # using a private root CA. The host trusts it because someone installed
+        # it; a freshly pulled image has a pristine public-only trust store and
+        # every `pip install` dies with "self-signed certificate in chain".
+        # No amount of `apt-get install ca-certificates` fixes that -- the cert
+        # is not public. Inheriting host trust is the correct default: the
+        # sandbox isolates the filesystem and processes, not the org's PKI.
+        self.ca_bundle = ""
+        for src in ("/etc/ssl/certs/ca-certificates.crt",
+                    "/etc/pki/tls/certs/ca-bundle.crt"):
+            if Path(src).exists():
+                dst = self.merged / src.lstrip("/")
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy(src, dst)
+                    self.ca_bundle = src
+                    break
+                except OSError:
+                    pass
+        self._mounted = True
+
+    def _umount(self) -> None:
+        if not self._mounted:
+            return
+        for _ in range(3):
+            _sh(f"umount -l {self.merged}/workspace")
+            _sh(f"umount -l {self.merged}")
+            if not _sh(f"mountpoint -q {self.merged}").returncode == 0:
+                break
+            time.sleep(0.15)
+        self._mounted = False
+
+    # ------------------------------------------------------------------
+    # snapshots -- the load-bearing feature
+    # ------------------------------------------------------------------
+
+    def snapshot(self, key: str) -> None:
+        self._umount()
+        target = self.layers_dir / key
+        shutil.rmtree(target, ignore_errors=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(self.live), str(target))
+        self.stack.append(key)
+        self._fresh_live()
+        self._mount()
+
+    def restore(self, key: Optional[str]) -> bool:
+        if key is not None and key not in self.stack:
+            return False
+        self._umount()
+        if key is None:
+            self.stack = []
+        else:
+            self.stack = self.stack[: self.stack.index(key) + 1]
+        self._fresh_live()
+        self._mount()
+        return True
+
+    def has_snapshot(self, key: str) -> bool:
+        return (self.layers_dir / key).exists()
+
+    def adopt(self, key: str) -> bool:
+        """Re-attach a snapshot that exists on disk from a previous run.
+        This is what makes the plan cache actually save time across sessions."""
+        if not self.has_snapshot(key) or key in self.stack:
+            return False
+        self._umount()
+        self.stack.append(key)
+        self._fresh_live()
+        self._mount()
+        return True
+
+    # ------------------------------------------------------------------
+    # execution
+    # ------------------------------------------------------------------
+
+    def exec(self, step: Step, env: dict[str, str], stream=None) -> ExecResult:
+        if not self._mounted:
+            self._mount()
+
+        merged_env = {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME": "/root", "TERM": "xterm", "LANG": "C.UTF-8",
+            "DEBIAN_FRONTEND": "noninteractive", "PYTHONUNBUFFERED": "1",
+            "CI": "1", "NO_COLOR": "1",
+            **self._ca_env(), **env, **step.env,
+        }
+        exports = "\n".join(
+            f"export {k}={_q(v)}" for k, v in merged_env.items()
+        )
+
+        script = f"""#!/bin/sh
+mount -t proc proc /proc 2>/dev/null
+{exports}
+cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
+{step.cmd}
+"""
+        sp = self.merged / ".crucible-step.sh"
+        sp.write_text(script)
+        sp.chmod(0o755)
+
+        argv = self._ns_argv(step) + ["chroot", str(self.merged), "/bin/sh",
+                                      "/.crucible-step.sh"]
+
+        t0 = time.time()
+        buf: list[str] = []
+        timed_out = False
+        try:
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, preexec_fn=self._child_limits,
+            )
+        except OSError as e:
+            return ExecResult(False, 127, "", f"spawn failed: {e}", 0.0)
+
+        self._cgroup_attach(proc.pid)
+        if not step.network and self.pod is None:
+            bring_up_loopback(proc.pid)   # pod netns already has lo up
+        sampler = None
+        if step.network:
+            from ..netlog import SocketSampler
+            sampler = SocketSampler(proc.pid)
+            sampler.start()
+        try:
+            deadline = t0 + step.timeout
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                buf.append(line.rstrip("\n"))
+                if stream:
+                    stream(line.rstrip("\n"))
+                if time.time() > deadline:
+                    timed_out = True
+                    break
+            if timed_out:
+                _kill(proc)
+            code = proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            _kill(proc)
+            timed_out, code = True, 124
+        except KeyboardInterrupt:
+            _kill(proc)
+            raise
+
+        if sampler is not None:
+            sampler.stop()
+            self.peers.update(sampler.peers)
+
+        out = "\n".join(buf)
+        ok = (code == 0 and not timed_out) or step.allow_fail
+        return ExecResult(ok, code, out, "", round(time.time() - t0, 2), timed_out)
+
+    def spawn(self, step: Step, env: dict[str, str]) -> subprocess.Popen:
+        """Start a long-running process (the `run` command) without waiting."""
+        merged_env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                      "HOME": "/root", "PYTHONUNBUFFERED": "1",
+                      **self._ca_env(), **env, **step.env}
+        exports = "\n".join(f"export {k}={_q(v)}" for k, v in merged_env.items())
+        script = (f"#!/bin/sh\nmount -t proc proc /proc 2>/dev/null\n"
+                  f"{exports}\n"
+                  f"cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace\n"
+                  f"exec {step.cmd}\n")
+        sp = self.merged / ".crucible-run.sh"
+        sp.write_text(script)
+        sp.chmod(0o755)
+        proc = subprocess.Popen(
+            self._ns_argv(step) + ["chroot", str(self.merged), "/bin/sh",
+                                   "/.crucible-run.sh"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            preexec_fn=self._child_limits,
+        )
+        self._cgroup_attach(proc.pid)
+        if not step.network and self.pod is None:
+            bring_up_loopback(proc.pid)   # pod netns already has lo up
+        return proc
+
+    # ------------------------------------------------------------------
+    # limits
+    # ------------------------------------------------------------------
+
+    def _ca_env(self) -> dict[str, str]:
+        """Every ecosystem invented its own name for the same file."""
+        ca = getattr(self, "ca_bundle", "")
+        if not ca:
+            return {}
+        return {"SSL_CERT_FILE": ca, "REQUESTS_CA_BUNDLE": ca, "CURL_CA_BUNDLE": ca,
+                "PIP_CERT": ca, "NODE_EXTRA_CA_CERTS": ca, "GIT_SSL_CAINFO": ca,
+                "CARGO_HTTP_CAINFO": ca, "SSL_CERT_DIR": "/etc/ssl/certs"}
+
+    def _ns_argv(self, step: Step) -> list[str]:
+        """Namespace flags for one step.
+
+        Three cases, and the middle one is the reason this exists:
+
+          network=True        no net isolation -- build steps need egress
+          network=False, pod  JOIN the pod netns via nsenter: still no egress,
+                              but 127.0.0.1 now reaches the sidecars
+          network=False       fresh empty netns via unshare --net
+        """
+        ns = ["unshare", "--mount", "--uts", "--ipc", "--pid", "--fork", "--kill-child"]
+        if step.network:
+            return ns
+        if self.pod is not None and self.pod.pid:
+            return ["nsenter", "-t", str(self.pod.pid), "-n"] + ns
+        return ns + ["--net"]
+
+    @staticmethod
+    def _child_limits() -> None:
+        import resource
+        os.setsid()
+        try:
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            resource.setrlimit(resource.RLIMIT_NPROC, (4096, 4096))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (8 << 30, 8 << 30))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (8192, 8192))
+        except (ValueError, OSError):
+            pass
+
+    def _cgroup_setup(self) -> None:
+        v2 = Path("/sys/fs/cgroup/cgroup.controllers")
+        try:
+            if v2.exists():
+                g = Path(f"/sys/fs/cgroup/crucible-{self.id}")
+                g.mkdir(exist_ok=True)
+                _w(g / "memory.max", str(self.mem_mb * 1024 * 1024))
+                _w(g / "pids.max", str(self.pid_max))
+                _w(g / "cpu.max", f"{self.cpu_pct * 1000} 100000")
+                self._cg = [g]
+            else:
+                for ctl, f, v in (
+                    ("memory", "memory.limit_in_bytes", str(self.mem_mb * 1024 * 1024)),
+                    ("pids", "pids.max", str(self.pid_max)),
+                ):
+                    g = Path(f"/sys/fs/cgroup/{ctl}/crucible-{self.id}")
+                    if Path(f"/sys/fs/cgroup/{ctl}").exists():
+                        g.mkdir(exist_ok=True)
+                        _w(g / f, v)
+                        self._cg.append(g)
+        except OSError:
+            pass
+        if not self._cg:
+            self.log("  ! cgroups unavailable -- rlimits only")
+
+    def _cgroup_attach(self, pid: int) -> None:
+        for g in self._cg:
+            for f in ("cgroup.procs", "tasks"):
+                if (g / f).exists():
+                    _w(g / f, str(pid))
+                    break
+
+    def _cgroup_teardown(self) -> None:
+        for g in self._cg:
+            try:
+                g.rmdir()
+            except OSError:
+                pass
+        self._cg = []
+
+    def _install_system(self, pkgs: list[str]) -> None:
+        step = Step("system-packages",
+                    "apt-get update -qq && apt-get install -y -qq --no-install-recommends "
+                    + " ".join(pkgs),
+                    network=True, timeout=900, allow_fail=True)
+        self.log(f"  system packages: {' '.join(pkgs)}")
+        self.exec(step, {})
+
+
+def _q(v: str) -> str:
+    return "'" + str(v).replace("'", "'\\''") + "'"
+
+
+def _w(p: Path, v: str) -> None:
+    try:
+        p.write_text(v)
+    except OSError:
+        pass
+
+
+_LO_UP_SRC = """
+import socket, struct, fcntl
+SIOCGIFFLAGS, SIOCSIFFLAGS, IFF_UP = 0x8913, 0x8914, 0x1
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ifr = struct.pack('16sh', b'lo', 0)
+flags = struct.unpack('16sh', fcntl.ioctl(s, SIOCGIFFLAGS, ifr))[1]
+fcntl.ioctl(s, SIOCSIFFLAGS, struct.pack('16sh', b'lo', flags | IFF_UP))
+"""
+
+
+def bring_up_loopback(pid: int) -> bool:
+    """Raise `lo` inside pid's network namespace.
+
+    A fresh netns has loopback DOWN. So `--net` isolation does not merely cut
+    egress -- it also breaks 127.0.0.1, which silently kills any app that
+    binds localhost and makes the health probe report a false negative.
+
+    `ip link set lo up` is the usual incantation, but iproute2 is absent from
+    slim images (and from this host). Bringing the interface up is just a
+    SIOCSIFFLAGS ioctl, so we do it directly, and we run it via nsenter using
+    the *host's* Python: the sandbox rootfs is then irrelevant, and this works
+    against a scratch image with no userland at all.
+    """
+    try:
+        return subprocess.run(
+            ["nsenter", "-t", str(pid), "-n", "python3", "-c", _LO_UP_SRC],
+            capture_output=True, timeout=10,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _kill(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.kill()

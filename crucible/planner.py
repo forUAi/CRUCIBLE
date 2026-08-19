@@ -1,0 +1,417 @@
+"""
+CRUCIBLE :: planner.py
+
+Evidence -> RunPlan.
+
+Priority order, highest-fidelity signal first. The repo author knew more
+about their repo than any heuristic will, so anything they *declared* wins
+over anything we *infer*:
+
+    1. Dockerfile        -- parsed into a RunPlan, not built. See below.
+    2. devcontainer.json -- postCreateCommand etc.
+    3. Procfile          -- explicit process types
+    4. compose.yml       -- for the service topology (always merged in)
+    5. inference         -- language templates from evidence
+
+On (1): everyone treats a Dockerfile as a build format that requires a
+Docker daemon. It isn't. It's a declarative plan -- FROM/RUN/ENV/CMD map
+almost 1:1 onto our Step list. Interpreting it instead of building it means
+we honor the author's intent on any substrate, and -- more usefully -- each
+RUN becomes an independently snapshotted, independently repairable step.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shlex
+from pathlib import Path
+
+from .evidence import FRAMEWORKS
+from .schema import Evidence, RunPlan, Service, Step
+
+# Language -> (base image, install cmd by pkgmgr, run fallback)
+BASES = {
+    "python": "python:{v}-slim",
+    "node":   "node:{v}-slim",
+    "go":     "golang:{v}",
+    "rust":   "rust:{v}-slim",
+    "ruby":   "ruby:{v}-slim",
+    "java":   "eclipse-temurin:{v}-jdk",
+    "php":    "php:{v}-cli",
+    "elixir": "elixir:{v}",
+    "dotnet": "mcr.microsoft.com/dotnet/sdk:{v}",
+}
+DEFAULT_V = {"python": "3.12", "node": "22", "go": "1.23", "rust": "1", "ruby": "3.3",
+             "java": "21", "php": "8.3", "elixir": "1.17", "dotnet": "8.0"}
+
+INSTALL = {
+    "npm":      "npm ci --no-audit --no-fund || npm install --no-audit --no-fund",
+    "pnpm":     "corepack enable && pnpm install --frozen-lockfile || pnpm install",
+    "yarn":     "corepack enable && yarn install --immutable || yarn install",
+    "bun":      "bun install",
+    "pip":      "pip install --no-cache-dir -r requirements.txt",
+    "poetry":   "pip install poetry && poetry install --no-interaction --no-root",
+    "uv":       "pip install uv && uv sync --frozen || uv sync",
+    "pipenv":   "pip install pipenv && pipenv install --deploy --system",
+    "pdm":      "pip install pdm && pdm install",
+    "gomod":    "go mod download",
+    "cargo":    "cargo fetch",
+    "bundler":  "bundle install",
+    "composer": "composer install --no-interaction",
+    "maven":    "mvn -B -q dependency:go-offline",
+    "gradle":   "gradle --no-daemon dependencies",
+    "mix":      "mix local.hex --force && mix local.rebar --force && mix deps.get",
+    "dotnet":   "dotnet restore",
+}
+
+BUILD = {
+    "gomod":  "go build -o /tmp/app ./...",
+    "cargo":  "cargo build --release",
+    "maven":  "mvn -B -q package -DskipTests",
+    "gradle": "gradle --no-daemon build -x test",
+    "dotnet": "dotnet build -c Release",
+    "mix":    "mix compile",
+}
+
+# Ports that belong to a dependency, never to the app. A repo containing the
+# string 6379 is naming its Redis, not the port it serves on -- and letting one
+# through makes the oracle probe the sidecar and declare the app healthy while
+# the app is dead, which is the worst possible failure mode for a verifier.
+SERVICE_PORTS = {5432, 6379, 27017, 3306, 9200, 5672, 9092, 11211, 2181, 9000}
+
+SERVICE_IMAGES = {
+    "postgres":      ("postgres:16-alpine", 5432, {"POSTGRES_PASSWORD": "crucible",
+                                                   "POSTGRES_USER": "crucible",
+                                                   "POSTGRES_DB": "crucible"}),
+    "redis":         ("redis:7-alpine", 6379, {}),
+    "mongodb":       ("mongo:7", 27017, {}),
+    "mysql":         ("mysql:8", 3306, {"MYSQL_ROOT_PASSWORD": "crucible"}),
+    "elasticsearch": ("elasticsearch:8.14.0", 9200, {"discovery.type": "single-node"}),
+    "rabbitmq":      ("rabbitmq:3-alpine", 5672, {}),
+    "kafka":         ("bitnami/kafka:3.7", 9092, {}),
+}
+
+
+def plan(ev: Evidence, prefer: str = "auto") -> RunPlan:
+    if prefer in ("auto", "declared"):
+        if "dockerfile" in ev.declared:
+            p = _from_dockerfile(ev)
+            if p:
+                _merge_services(p, ev)
+                return p
+        if "devcontainer" in ev.declared:
+            p = _from_devcontainer(ev)
+            if p:
+                _merge_services(p, ev)
+                return p
+    p = _infer(ev)
+    if "procfile" in ev.declared:
+        _apply_procfile(p, ev)
+    _merge_services(p, ev)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# 1. Dockerfile as a plan source
+# ---------------------------------------------------------------------------
+
+_DF_CONT = re.compile(r"\\\s*\n", re.M)
+
+
+def _from_dockerfile(ev: Evidence) -> RunPlan | None:
+    path = Path(ev.root) / ev.declared["dockerfile"]
+    try:
+        text = _DF_CONT.sub(" ", path.read_text(errors="replace"))
+    except OSError:
+        return None
+
+    p = RunPlan()
+    p.note(f"plan source: {ev.declared['dockerfile']} (interpreted, not built)")
+    stages: list[str] = []
+    workdir = "."
+    n = 0
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        instr, _, rest = line.partition(" ")
+        instr, rest = instr.upper(), rest.strip()
+
+        if instr == "FROM":
+            img = rest.split(" AS ")[0].split(" as ")[0].strip()
+            stages.append(img)
+            # last stage wins -- multi-stage builds end at the runtime image
+            p.base = img
+        elif instr == "RUN":
+            n += 1
+            p.steps.append(Step(f"df-run-{n}", rest, network=True, cwd=workdir))
+        elif instr == "WORKDIR":
+            workdir = rest.strip("/") or "."
+            p.workdir = workdir
+        elif instr in ("ENV",):
+            for k, v in _kv(rest):
+                p.env[k] = v
+        elif instr == "ARG":
+            k, _, v = rest.partition("=")
+            if v:
+                p.env.setdefault(k.strip(), v.strip().strip('"\''))
+        elif instr == "EXPOSE":
+            for tok in rest.split():
+                num = tok.split("/")[0]
+                if num.isdigit():
+                    p.ports.append(int(num))
+        elif instr in ("CMD", "ENTRYPOINT"):
+            p.run = _joinexec(rest) if instr == "CMD" or not p.run else f"{_joinexec(rest)} {p.run}"
+
+    if len(stages) > 1:
+        p.note(f"multi-stage ({len(stages)} stages) -- flattened, using final base {p.base}")
+    if not p.run:
+        return None
+    p.ports = sorted(set(p.ports)) or _app_ports(ev)
+    p.archetype = "web" if p.ports else "cli"
+    p.oracle = {"kind": "http" if p.ports else "exit0", "port": p.ports[0] if p.ports else 0}
+    return p
+
+
+def _kv(rest: str) -> list[tuple[str, str]]:
+    if "=" not in rest.split()[0] if rest.split() else True:
+        k, _, v = rest.partition(" ")
+        return [(k, v.strip().strip('"\''))]
+    out = []
+    try:
+        for tok in shlex.split(rest):
+            if "=" in tok:
+                k, _, v = tok.partition("=")
+                out.append((k, v))
+    except ValueError:
+        pass
+    return out
+
+
+def _joinexec(rest: str) -> str:
+    rest = rest.strip()
+    if rest.startswith("["):
+        try:
+            return " ".join(shlex.quote(a) if " " in a else a for a in json.loads(rest))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return rest
+
+
+def _from_devcontainer(ev: Evidence) -> RunPlan | None:
+    path = Path(ev.root) / ev.declared["devcontainer"]
+    try:
+        raw = re.sub(r"//[^\n]*", "", path.read_text(errors="replace"))
+        data = json.loads(re.sub(r",(\s*[}\]])", r"\1", raw))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    p = RunPlan()
+    p.note(f"plan source: {ev.declared['devcontainer']}")
+    p.base = data.get("image") or "ubuntu:24.04"
+    p.env.update(data.get("containerEnv") or {})
+    for k in ("onCreateCommand", "updateContentCommand", "postCreateCommand"):
+        if c := data.get(k):
+            p.steps.append(Step(k, c if isinstance(c, str) else " && ".join(c.values() if isinstance(c, dict) else c)))
+    p.ports = [int(x) for x in data.get("forwardPorts", []) if str(x).isdigit()] or _app_ports(ev)
+    if not p.steps:
+        return None
+    p.archetype = "web" if p.ports else "cli"
+    p.oracle = {"kind": "http" if p.ports else "exit0", "port": p.ports[0] if p.ports else 0}
+    return p
+
+
+def _apply_procfile(p: RunPlan, ev: Evidence) -> None:
+    try:
+        txt = (Path(ev.root) / ev.declared["procfile"]).read_text(errors="replace")
+    except OSError:
+        return
+    procs = dict(
+        (m.group(1), m.group(2).strip())
+        for m in re.finditer(r"^(\w+):\s*(.+)$", txt, re.M)
+    )
+    if cmd := (procs.get("web") or next(iter(procs.values()), "")):
+        p.run = cmd
+        p.note(f"run command from Procfile ({'web' if 'web' in procs else 'first entry'})")
+        if "web" in procs:
+            p.archetype = "web"
+
+
+# ---------------------------------------------------------------------------
+# 5. Inference
+# ---------------------------------------------------------------------------
+
+def _app_ports(ev: Evidence) -> list[int]:
+    return [p for p in ev.ports if p not in SERVICE_PORTS]
+
+
+def _infer(ev: Evidence) -> RunPlan:
+    p = RunPlan()
+    lang = ev.top("language") or "unknown"
+    pm = _pick_pkgmgr(ev, lang)
+    fw = ev.top("framework")
+
+    ver = _version_for(ev, lang)
+    tmpl = BASES.get(lang)
+    p.base = tmpl.format(v=ver) if tmpl else "ubuntu:24.04"
+    p.note(f"language={lang} ({', '.join(ev.why('language', lang)[:2]) or 'file mix'})")
+    p.note(f"base={p.base} (runtime pin: {ver})")
+
+    p.system_packages = sorted(set(ev.native_hints))
+    if p.system_packages:
+        p.note(f"native deps inferred from source: {', '.join(p.system_packages)}")
+
+    # --- install ---
+    if pm and pm in INSTALL:
+        cmd = INSTALL[pm]
+        if pm == "pip" and "requirements.txt" not in ev.files:
+            cmd = "pip install --no-cache-dir -e . || pip install --no-cache-dir ."
+        p.steps.append(Step(f"install/{pm}", cmd, network=True, timeout=1800))
+        p.note(f"package manager={pm} ({', '.join(ev.why('pkgmgr', pm)[:2])})")
+
+    # --- build ---
+    if pm in BUILD:
+        p.steps.append(Step(f"build/{pm}", BUILD[pm], network=True, timeout=1800))
+    elif lang == "node" and "build" in ev.scripts:
+        # only build if a framework that needs it is present
+        if fw in ("next", "nuxt", "vite", "remix", "astro", "nest"):
+            p.steps.append(Step("build/npm", ev.scripts["build"], network=True, timeout=1800))
+
+    # --- archetype + run ---
+    arch, port, run = _pick_run(ev, lang, pm, fw)
+    p.archetype, p.run = arch, run
+    p.ports = sorted({port, *_app_ports(ev)} - {0}) if port else _app_ports(ev)
+    p.note(f"archetype={arch} via {'framework ' + fw if fw else 'entrypoint heuristics'}")
+
+    for k in ev.env_keys:
+        p.env.setdefault(k, _synth_env(k))
+    if ev.env_keys:
+        p.note(f"synthesized {len(ev.env_keys)} env vars from .env.example")
+
+    p.oracle = _oracle_for(arch, p.ports)
+    return p
+
+
+def _pick_pkgmgr(ev: Evidence, lang: str) -> str | None:
+    ranked = ev.tally("pkgmgr")
+    lang_pms = {
+        "python": {"uv", "poetry", "pdm", "pipenv", "pip", "conda"},
+        "node": {"pnpm", "yarn", "bun", "npm"},
+        "go": {"gomod"}, "rust": {"cargo"}, "ruby": {"bundler"},
+        "java": {"gradle", "maven"}, "php": {"composer"}, "elixir": {"mix"},
+        "dotnet": {"dotnet"},
+    }.get(lang, set())
+    for name, _ in ranked:
+        if name in lang_pms:
+            return name
+    return ranked[0][0] if ranked else None
+
+
+def _version_for(ev: Evidence, lang: str) -> str:
+    for val, _ in ev.tally("runtime"):
+        rt, _, v = val.partition(":")
+        if rt == lang or (rt == "nodejs" and lang == "node"):
+            return v
+    return DEFAULT_V.get(lang, "latest")
+
+
+def _pick_run(ev: Evidence, lang: str, pm: str | None, fw: str | None) -> tuple[str, int, str]:
+    entry = ev.entrypoints[0]["path"] if ev.entrypoints else ""
+    aports = _app_ports(ev)
+
+    if fw and fw in FRAMEWORKS:
+        arch, port, hint = FRAMEWORKS[fw]
+        if fw == "django":
+            return arch, port, "python manage.py migrate --noinput; python manage.py runserver 0.0.0.0:8000"
+        if fw == "fastapi":
+            mod = _guess_module(ev) or "main"
+            return arch, port, f"uvicorn {mod}:app --host 0.0.0.0 --port {port}"
+        if fw == "flask":
+            mod = _guess_module(ev) or "app"
+            return arch, port, f"FLASK_APP={mod} flask run --host=0.0.0.0 --port={port}"
+        if fw == "streamlit":
+            return arch, port, f"streamlit run {entry or 'app.py'} --server.address 0.0.0.0 --server.port {port}"
+        if hint:
+            return arch, port, hint
+
+    if lang == "node":
+        for cand in ("start", "dev", "serve"):
+            if cand in ev.scripts:
+                return ("web" if aports or fw else "cli"), (aports[0] if aports else 3000), f"npm run {cand}"
+        if entry:
+            return "cli", 0, f"node {entry}"
+    if lang == "python" and entry:
+        return ("web" if aports else "cli"), (aports[0] if aports else 0), f"python {entry}"
+    # Compiled languages: absence of a main function is *positive* evidence of
+    # a library, not a detection failure. Running `cargo run` on a crate with
+    # only lib.rs fails with a confusing error; running its tests proves the
+    # same thing (it builds, it works) and is what the author intended.
+    if lang == "go":
+        if any(f.endswith("main.go") for f in ev.files):
+            return ("web" if aports else "cli"), (aports[0] if aports else 0), "/tmp/app"
+        return "library", 0, "go test ./..."
+    if lang == "rust":
+        if any(f in ("src/main.rs", "main.rs") or f.startswith("src/bin/") for f in ev.files):
+            return ("web" if aports else "cli"), (aports[0] if aports else 0), "cargo run --release"
+        return "library", 0, "cargo test"
+    if pm == "make" and "make run" in ev.scripts:
+        return "cli", 0, "make run"
+
+    # Nothing runnable found -> it is probably a library. Prove it with tests.
+    return "library", 0, _test_cmd(lang, pm)
+
+
+def _test_cmd(lang: str, pm: str | None) -> str:
+    return {
+        "python": "pytest -q || python -m unittest discover -v",
+        "node": "npm test", "go": "go test ./...", "rust": "cargo test",
+        "ruby": "bundle exec rspec || rake test", "java": "mvn -B test",
+        "elixir": "mix test", "php": "vendor/bin/phpunit",
+    }.get(lang, "make test")
+
+
+def _guess_module(ev: Evidence) -> str | None:
+    for e in ev.entrypoints:
+        if e["path"].endswith(".py"):
+            return e["path"][:-3].replace("/", ".")
+    return None
+
+
+def _synth_env(key: str) -> str:
+    k = key.upper()
+    if "DATABASE_URL" in k or "POSTGRES_URL" in k:
+        return "postgresql://crucible:crucible@127.0.0.1:5432/crucible"
+    if "REDIS" in k:
+        return "redis://127.0.0.1:6379/0"
+    if "MONGO" in k:
+        return "mongodb://127.0.0.1:27017/crucible"
+    if any(t in k for t in ("SECRET", "KEY", "TOKEN", "PASSWORD", "SALT")):
+        return "crucible-dev-placeholder-not-a-real-secret"
+    if "PORT" in k:
+        return "8000"
+    if k in ("NODE_ENV", "ENV", "ENVIRONMENT", "APP_ENV"):
+        return "development"
+    if "HOST" in k:
+        return "0.0.0.0"
+    return "crucible"
+
+
+def _oracle_for(arch: str, ports: list[int]) -> dict:
+    if arch == "web" and ports:
+        return {"kind": "http", "port": ports[0], "path": "/", "grace": 45}
+    if arch == "worker":
+        return {"kind": "alive", "seconds": 20}
+    if arch == "library":
+        return {"kind": "exit0"}
+    return {"kind": "exit0"}
+
+
+def _merge_services(p: RunPlan, ev: Evidence) -> None:
+    wanted = {s.value for s in ev.signals if s.kind == "service"}
+    for name in sorted(wanted):
+        if name not in SERVICE_IMAGES or any(s.name == name for s in p.services):
+            continue
+        img, port, env = SERVICE_IMAGES[name]
+        p.services.append(Service(name, img, [port], dict(env)))
+        p.note(f"sidecar {name} ({img}) -- detected in source")
