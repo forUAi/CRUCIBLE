@@ -56,6 +56,16 @@ def _sh(cmd: str, check: bool = False) -> subprocess.CompletedProcess:
 _STORE_READY = False
 
 
+def _ram_mb() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 2048
+
+
 def default_store_mb(floor: int = 4096, ceiling: int = 65536) -> int:
     """Half the free space where the store will live, within bounds.
 
@@ -105,15 +115,25 @@ def ensure_private_store(size_mb: int = 4096, log=print) -> None:
                 # Project quotas have to be baked in at mkfs time; they cannot
                 # be turned on later for an image already in use.
                 _sh(f"mkfs.ext4 -q -F {mkfs_options()} {img}")
-            if _sh(f"mount -o loop,{mount_options()} {img} {STATE_ROOT}").returncode == 0:
+            r = _sh(f"mount -o loop,{mount_options()} {img} {STATE_ROOT}")
+            if r.returncode != 0:
+                log(f"  ! loop store mount failed: {r.stderr.strip()[:120]}")
+            if r.returncode == 0:
                 log(f"  store: ext4 loop image ({size_mb} MB) at {STATE_ROOT}")
                 _STORE_READY = True
                 return
         except OSError:
             pass
 
-    if _sh(f"mount -t tmpfs -o size={size_mb}m tmpfs {STATE_ROOT}").returncode == 0:
-        log(f"  store: tmpfs ({size_mb} MB) at {STATE_ROOT}")
+    # Last resort, and deliberately small. tmpfs is RAM: sizing it from free
+    # DISK put an 18 GB store on a 6 GiB VM and the kernel OOM-killed a
+    # process mid-run. It also cannot carry project quotas, so a budget on it
+    # reports UNAVAILABLE rather than pretending.
+    ram_mb = _ram_mb()
+    tmpfs_mb = max(512, min(size_mb, ram_mb // 4))
+    if _sh(f"mount -t tmpfs -o size={tmpfs_mb}m tmpfs {STATE_ROOT}").returncode == 0:
+        log(f"  \033[33m! store: tmpfs ({tmpfs_mb} MB, capped to a quarter of "
+            f"{ram_mb} MB RAM) -- disk budgets cannot be enforced here\033[0m")
         _STORE_READY = True
     else:
         log("  ! could not create a private store -- snapshots may fail on host base")
