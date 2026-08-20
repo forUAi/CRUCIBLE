@@ -326,7 +326,62 @@ Concurrent *crashed* runs (two abandoned runs reaped in one pass), host-side
 controller interruption, and cleanup under a full disk. The reaper is written
 to handle them; they are not yet in the matrix.
 
-## 8. Honest maturity label
+## 8. Disk budget evidence
+
+```bash
+sudo python3 -m crucible.cli <repo> --disk-mb 512 --verbose
+```
+
+| Check | Result |
+|---|---|
+| Budget applied | `disk budget: 512 MB (ext4 project 321087)` |
+| Bomb asked for | 20 GB, in 8 MiB fsync'd chunks |
+| Kernel stopped it at | **504 MB**, `errno 122 EDQUOT` |
+| Run outcome | `EXHAUSTED — sandbox resource exhausted (EDQUOT) … Raise --disk-mb` |
+| Store afterwards | 149 MB used of 17 GB; other jobs unaffected |
+| Negative control | `examples/py-fastapi` under the same 512 MB budget: **SUCCESS** |
+| Four-ecosystem regression with budgets on | **4/4 verified** |
+
+Five defects had to be fixed before that number meant anything, and four of
+them would have produced a *vacuously passing* test:
+
+1. **`quota_v2` is absent from the Lima kernel.** `CONFIG_QFMT_V2=m` and the
+   Ubuntu cloud image ships without the module, so ext4 could not enable
+   quota tracking and the store mount failed with `ESRCH`.
+   `linux-modules-extra` is now a declared dependency.
+2. **Root ignores quota hard limits.** Sandboxed builds run as uid 0 and the
+   kernel's `ignore_hardlimit()` lets `CAP_SYS_RESOURCE` write straight past
+   a quota: 200 MB written against a 64 MB limit, in full. The capability is
+   now dropped in the sandbox — which is right independently, since it also
+   governs raising rlimits and using reserved blocks.
+3. **`chattr -R +P` walks into regular files**, where the project-inherit
+   flag is invalid, and fails. Every budget silently reported UNENFORCED.
+4. **The box directory was created before the store was mounted over it**, so
+   the tree the quota was applied to was not always the tree the sandbox
+   wrote to.
+5. **Step logs lived inside the budgeted tree.** When a repository exhausted
+   its budget, the write that would have recorded *why* was refused too: the
+   step exited 1 having said nothing, and the run blamed the repository
+   rather than the ceiling. Evidence cannot live inside the resource the
+   workload is allowed to consume.
+
+Two rejected designs, recorded because the reasons are load-bearing:
+
+- *Watch usage and kill the job.* Not enforcement. `du` is racy, the write
+  has already landed, and a fast writer outruns the poll.
+- *A loop-mounted filesystem per sandbox.* Enforces absolutely and breaks
+  `snapshot()`, which is O(1) only because it is a rename within one
+  filesystem. Across filesystems it silently becomes a recursive copy and the
+  repair loop stops being affordable.
+
+### Not yet covered
+
+Concurrent jobs collectively exhausting the store (a global ceiling exists
+only as the store size), cache-lifecycle policy, and sparse-image growth
+accounting. The 3.2 GB warm cache was **not** deleted to make any of this
+pass.
+
+## 9. Honest maturity label
 
 **Working prototype with a verified execution path on four ecosystems.**
 
