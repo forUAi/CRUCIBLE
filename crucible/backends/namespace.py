@@ -127,6 +127,7 @@ class NamespaceBackend(SandboxBackend):
         self.dns = None                     # optional DnsLedger
         self.peers: dict = {}               # (ip, port) -> first seen
         self.image_env: dict[str, str] = {}  # ENV declared by the base image
+        self.drain_grace = 2.0              # seconds to keep reading after exit
         self._mounted = False
         self._cg: list[Path] = []
 
@@ -389,15 +390,7 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
             sampler = SocketSampler(proc.pid)
             sampler.start()
         try:
-            deadline = t0 + step.timeout
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                buf.append(line.rstrip("\n"))
-                if stream:
-                    stream(line.rstrip("\n"))
-                if time.time() > deadline:
-                    timed_out = True
-                    break
+            timed_out = self._pump(proc, step, buf, stream, t0)
             if timed_out:
                 _kill(proc)
             code = proc.wait(timeout=15)
@@ -415,6 +408,68 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         out = "\n".join(buf)
         ok = (code == 0 and not timed_out) or step.allow_fail
         return ExecResult(ok, code, out, "", round(time.time() - t0, 2), timed_out)
+
+    def _pump(self, proc, step: Step, buf: list, stream, t0: float) -> bool:
+        """Read the step's output while enforcing its deadline. Returns timed_out.
+
+        Two ways the obvious loop hangs forever, both reachable by a repo that
+        merely spawns a daemon -- and both trivially weaponised:
+
+        `for line in proc.stdout` blocks in read(). The deadline was only
+        checked after a line arrived, so a process that goes quiet is never
+        timed out at all. A hostile setup.py hung a build step for 13 minutes
+        against a 30 minute budget and would have held it for the full 30.
+
+        EOF on the pipe means *every* holder closed it, not that our child
+        exited. A `subprocess.Popen(..., start_new_session=True)` in a build
+        script inherits stdout and keeps the pipe open after the step's own
+        command is done, so waiting for EOF waits for the daemon.
+
+        So: poll with a timeout, check the clock every pass, and stop shortly
+        after the direct child is reaped whether or not the pipe closed.
+        """
+        import selectors
+
+        deadline = t0 + step.timeout
+        fd = proc.stdout.fileno()
+        os.set_blocking(fd, False)
+        sel = selectors.DefaultSelector()
+        sel.register(fd, selectors.EVENT_READ)
+        pending = b""
+        exited_at = None
+        try:
+            while True:
+                if time.time() > deadline:
+                    return True
+                if sel.select(timeout=0.2):
+                    try:
+                        chunk = os.read(fd, 65536)
+                    except (BlockingIOError, InterruptedError):
+                        chunk = None
+                    except OSError:
+                        break
+                    if chunk == b"":
+                        break                      # real EOF, nobody holds it
+                    if chunk:
+                        pending += chunk
+                        parts = pending.split(b"\n")
+                        pending = parts.pop()
+                        for raw in parts:
+                            line = raw.decode("utf-8", "replace")
+                            buf.append(line)
+                            if stream:
+                                stream(line)
+                        continue                   # drain before re-checking
+                if proc.poll() is not None:
+                    if exited_at is None:
+                        exited_at = time.time()
+                    elif time.time() - exited_at > self.drain_grace:
+                        break
+        finally:
+            sel.close()
+            if pending:
+                buf.append(pending.decode("utf-8", "replace"))
+        return False
 
     def spawn(self, step: Step, env: dict[str, str]) -> subprocess.Popen:
         """Start a long-running process (the `run` command) without waiting."""
