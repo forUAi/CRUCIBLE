@@ -207,8 +207,19 @@ class NamespaceBackend(SandboxBackend):
             _sh(f"mount --bind {self.repo} {ws} && mount -o remount,ro,bind {ws}")
             self.log("  ! workspace COW unavailable, mounted read-only")
 
-        for d in ("proc", "sys", "dev", "tmp", "run"):
+        for d in ("proc", "sys", "dev", "tmp", "run", "var/tmp"):
             (self.merged / d).mkdir(parents=True, exist_ok=True)
+        # mkdir applies the umask, exactly as mknod does for /dev/null. A /tmp
+        # that comes out 0755 root-owned breaks every tool that drops
+        # privileges before using it: apt runs its GPG verification as `_apt`
+        # and fails with "Couldn't create temporary file /tmp/apt.conf.XXXX",
+        # which surfaces as an unsigned-repository error and takes the whole
+        # apt-get down. The sticky bit is part of the container /tmp contract.
+        for d in ("tmp", "var/tmp"):
+            try:
+                os.chmod(self.merged / d, 0o1777)
+            except OSError as e:
+                self.log(f"  ! could not chmod /{d}: {e}")
         from ..pod import populate_dev
         populate_dev(self.merged)
         # DNS for network-enabled steps. When a ledger is attached, point the

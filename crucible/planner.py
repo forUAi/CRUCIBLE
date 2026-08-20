@@ -141,7 +141,26 @@ def _finish(p: RunPlan) -> RunPlan:
     door -- so the rule belongs on the way out, where all three doors meet.
     """
     _deconflict_ports(p)
+    _declare_port_env(p)
     return p
+
+
+def _declare_port_env(p: RunPlan) -> None:
+    """Tell the app which port we are going to probe.
+
+    Twelve-factor apps read $PORT and fall back to their own default:
+    heroku/node-js-getting-started is `process.env.PORT || 5006`. The plan
+    chose 3000 from the express convention, never exported it, the app bound
+    5006, and the oracle waited 45s on a port nothing was ever going to use.
+    The verifier and the app have to agree on the number, and the only way to
+    make that true rather than lucky is to state it.
+
+    An author-set PORT is left alone -- disagreeing with it is the linter's
+    job, not a silent overwrite.
+    """
+    if p.archetype == "web" and p.ports and "PORT" not in p.env:
+        p.env["PORT"] = str(p.ports[0])
+        p.note(f"exported PORT={p.ports[0]} so the app binds where the oracle probes")
 
 
 def _deconflict_ports(p: RunPlan) -> None:

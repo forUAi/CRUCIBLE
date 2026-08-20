@@ -363,6 +363,37 @@ def _r_jvm_heap(m, plan, step):
                  }), tags=["jvm", "resources"])
 
 
+@rule(r"(?:listening|listening on|running at|started on|bound to|server on)\D{0,24}(\d{2,5})\b")
+def _r_announced_port(m, plan, step):
+    """The app said where it is. Believe it over the convention.
+
+    A web app that starts cleanly and binds a port we are not probing is the
+    single most common false negative: the oracle waits out its grace period
+    against a port nothing will ever open and the repo is reported broken.
+    The app's own startup line is better evidence than a framework default,
+    so retarget onto it rather than declaring the run failed.
+    """
+    current = plan.ports[0] if plan.ports else None
+    for hit in re.finditer(m.re.pattern, m.string, re.I | re.M):
+        port = int(hit.group(1))
+        if port == current or not (1024 <= port <= 65535) or port in _DEP_PORTS:
+            continue
+
+        def fix(p, port=port):
+            p.ports = [port] + [x for x in p.ports if x != port]
+            if p.oracle.get("kind") == "http":
+                p.oracle["port"] = port
+            p.env["PORT"] = str(port)
+        return Patch(f"app announced port {port}, oracle was probing "
+                     f"{current} -> retarget", 0.9, fix, tags=["runtime"])
+    return None
+
+
+# Dependency ports, mirrored from the planner: an app announcing 5432 is
+# echoing its database's address, not its own.
+_DEP_PORTS = {5432, 6379, 27017, 3306, 9200, 5672, 9092, 11211, 2181, 9000}
+
+
 # --- runtime / connectivity -------------------------------------------------
 
 @rule(r"(?:EADDRINUSE|Address already in use|bind: address already in use).*?(\d{2,5})?")
