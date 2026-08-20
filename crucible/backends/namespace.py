@@ -54,6 +54,9 @@ def _sh(cmd: str, check: bool = False) -> subprocess.CompletedProcess:
 
 
 _STORE_READY = False
+# preexec_fn runs in the forked child and cannot close over self; a one-slot
+# module global carries the per-sandbox file-size ceiling across the fork.
+_FSIZE_MB = [0]
 
 
 def _ram_mb() -> int:
@@ -182,6 +185,11 @@ class NamespaceBackend(SandboxBackend):
 
     def up(self, base: str, repo_path: str, system_packages: list[str]) -> None:
         self.repo = Path(repo_path).resolve()
+        # The store must exist before anything is written into it. Creating
+        # the box directory first put it on the root filesystem, and mounting
+        # the store over /var/lib/crucible then shadowed it -- so the tree the
+        # quota was applied to was not always the tree the sandbox used.
+        ensure_private_store(self.store_mb, self.log)
         self._claim()
         for d in (self.layers_dir, self.merged):
             d.mkdir(parents=True, exist_ok=True)
@@ -198,12 +206,6 @@ class NamespaceBackend(SandboxBackend):
         elif hb:
             self.log(f"  !! EXECUTING AGAINST A HOST-BACKED MOUNT ({hb[1]}) -- "
                      f"staging disabled; the host filesystem is reachable")
-
-        # The store is always its own filesystem now, not only for --base
-        # host. It was created there to dodge overlayfs ELOOP; it is created
-        # here as well because a plain directory on / has nowhere to hang a
-        # per-sandbox disk quota, and an unenforceable budget is not a budget.
-        ensure_private_store(self.store_mb, self.log)
 
         if base in ("host", "", None):
             # Fastest path: the host rootfs is the read-only lower layer.
@@ -232,6 +234,7 @@ class NamespaceBackend(SandboxBackend):
         from ..diskbudget import apply as apply_budget
         self.budget = apply_budget(self.dir, self.id, self.disk_mb,
                                    STATE_ROOT, self.log)
+        _FSIZE_MB[0] = self.disk_mb
         if self.disk_mb and not self.budget.enforced:
             self.log(f"  \033[33m! disk budget UNENFORCED: "
                      f"{self.budget.reason}\033[0m")
@@ -668,7 +671,12 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         try:
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             resource.setrlimit(resource.RLIMIT_NPROC, (4096, 4096))
-            resource.setrlimit(resource.RLIMIT_FSIZE, (8 << 30, 8 << 30))
+            # Tie the single-file ceiling to the sandbox budget. It was a
+            # flat 8 GiB, so a disk bomb against a 512 MB budget was stopped
+            # by EFBIG at 8 GiB rather than by the budget -- which is the
+            # wrong control reporting the wrong reason.
+            fsize = min(8 << 30, (_FSIZE_MB[0] << 20) if _FSIZE_MB[0] else (8 << 30))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
             resource.setrlimit(resource.RLIMIT_NOFILE, (8192, 8192))
         except (ValueError, OSError):
             pass
