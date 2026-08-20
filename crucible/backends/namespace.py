@@ -410,12 +410,29 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         t0 = time.time()
         buf: list[str] = []
         timed_out = False
+        # Step output goes to a FILE, not to a pipe we hold.
+        #
+        # A pipe reaches EOF when every holder closes it, and a build script
+        # can hand our write end to anything. A hostile setup.py spawned a
+        # detached `sleep 900`; it inherited the descriptor, pip's own build
+        # subprocess became a zombie whose pipe was still held, pip blocked
+        # reading it, and the step stalled with CRUCIBLE waiting on a
+        # descriptor a grandchild controlled. Reading a file removes the
+        # dependency entirely: nothing a descendant does can block the
+        # supervisor, and the deadline is the only thing that decides.
+        logpath = self.dir / f"step-{step.name.replace('/', '_')}.log"
+        try:
+            logpath.parent.mkdir(parents=True, exist_ok=True)
+            sink = open(logpath, "wb")
+        except OSError as e:
+            return ExecResult(False, 127, "", f"could not open step log: {e}", 0.0)
         try:
             proc = subprocess.Popen(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, preexec_fn=self._child_limits,
+                argv, stdout=sink, stderr=subprocess.STDOUT,
+                preexec_fn=self._child_limits,
             )
         except OSError as e:
+            sink.close()
             return ExecResult(False, 127, "", f"spawn failed: {e}", 0.0)
 
         self._cgroup_attach(proc.pid)
@@ -427,7 +444,7 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
             sampler = SocketSampler(proc.pid)
             sampler.start()
         try:
-            timed_out = self._pump(proc, step, buf, stream, t0)
+            timed_out = self._pump(proc, step, buf, stream, t0, logpath)
             if timed_out:
                 _kill(proc)
             code = proc.wait(timeout=15)
@@ -438,6 +455,7 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
             _kill(proc)
             raise
 
+        sink.close()
         if sampler is not None:
             sampler.stop()
             self.peers.update(sampler.peers)
@@ -446,64 +464,62 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         ok = (code == 0 and not timed_out) or step.allow_fail
         return ExecResult(ok, code, out, "", round(time.time() - t0, 2), timed_out)
 
-    def _pump(self, proc, step: Step, buf: list, stream, t0: float) -> bool:
-        """Read the step's output while enforcing its deadline. Returns timed_out.
+    def _pump(self, proc, step: Step, buf: list, stream, t0: float,
+              logpath: Path) -> bool:
+        """Tail the step's log while enforcing its deadline. Returns timed_out.
 
-        Two ways the obvious loop hangs forever, both reachable by a repo that
-        merely spawns a daemon -- and both trivially weaponised:
+        Two properties, both learned by watching a fixture defeat the obvious
+        version:
 
-        `for line in proc.stdout` blocks in read(). The deadline was only
-        checked after a line arrived, so a process that goes quiet is never
-        timed out at all. A hostile setup.py hung a build step for 13 minutes
-        against a 30 minute budget and would have held it for the full 30.
+        The clock is checked on every pass, not after a line arrives. The
+        original `for line in proc.stdout` blocks in read(), so a process that
+        goes quiet was never timed out at all and the budget was decorative.
 
-        EOF on the pipe means *every* holder closed it, not that our child
-        exited. A `subprocess.Popen(..., start_new_session=True)` in a build
-        script inherits stdout and keeps the pipe open after the step's own
-        command is done, so waiting for EOF waits for the daemon.
-
-        So: poll with a timeout, check the clock every pass, and stop shortly
-        after the direct child is reaped whether or not the pipe closed.
+        Nothing a descendant does can stall the supervisor, because the
+        supervisor is reading a file rather than a descriptor the descendant
+        holds. That is why the step's stdout is a file: EOF on a pipe means
+        every holder closed it, and a build script gets to decide who the
+        holders are.
         """
-        import selectors
-
         deadline = t0 + step.timeout
-        fd = proc.stdout.fileno()
-        os.set_blocking(fd, False)
-        sel = selectors.DefaultSelector()
-        sel.register(fd, selectors.EVENT_READ)
         pending = b""
+        pos = 0
         exited_at = None
+
+        def drain() -> None:
+            nonlocal pending, pos
+            try:
+                with open(logpath, "rb") as fh:
+                    fh.seek(pos)
+                    chunk = fh.read()
+                    pos = fh.tell()
+            except OSError:
+                return
+            if not chunk:
+                return
+            pending += chunk
+            parts = pending.split(b"\n")
+            pending = parts.pop()
+            for raw in parts:
+                line = raw.decode("utf-8", "replace")
+                buf.append(line)
+                if stream:
+                    stream(line)
+
         try:
             while True:
                 if time.time() > deadline:
+                    drain()
                     return True
-                if sel.select(timeout=0.2):
-                    try:
-                        chunk = os.read(fd, 65536)
-                    except (BlockingIOError, InterruptedError):
-                        chunk = None
-                    except OSError:
-                        break
-                    if chunk == b"":
-                        break                      # real EOF, nobody holds it
-                    if chunk:
-                        pending += chunk
-                        parts = pending.split(b"\n")
-                        pending = parts.pop()
-                        for raw in parts:
-                            line = raw.decode("utf-8", "replace")
-                            buf.append(line)
-                            if stream:
-                                stream(line)
-                        continue                   # drain before re-checking
+                drain()
                 if proc.poll() is not None:
                     if exited_at is None:
                         exited_at = time.time()
                     elif time.time() - exited_at > self.drain_grace:
                         break
+                time.sleep(0.05)
         finally:
-            sel.close()
+            drain()
             if pending:
                 buf.append(pending.decode("utf-8", "replace"))
         return False

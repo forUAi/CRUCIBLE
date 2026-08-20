@@ -140,7 +140,8 @@ class Engine:
                  llm: Optional[Callable] = None, log=print, mem_mb: int = 2048,
                  run_offline: bool = True, use_cache: bool = True,
                  base_override: Optional[str] = None,
-                 store_mb: Optional[int] = None):
+                 store_mb: Optional[int] = None,
+                 step_timeout: Optional[int] = None):
         self.backend_cls = backend_cls
         self.budget = budget
         self.llm = llm
@@ -151,6 +152,7 @@ class Engine:
         self.base_override = base_override
         from .backends.namespace import default_store_mb
         self.store_mb = store_mb or default_store_mb()
+        self.step_timeout = step_timeout
 
     # ------------------------------------------------------------------
 
@@ -324,6 +326,8 @@ class Engine:
                 self.log(f"  \033[2m⤳ {step.name}  (snapshot hit, skipped)\033[0m")
                 continue
             self.log(f"  → {step.name}: \033[2m{step.cmd[:110]}\033[0m")
+            if self.step_timeout:
+                step.timeout = min(step.timeout, self.step_timeout)
             res = box.exec(step, plan.env, stream=None)
             if not res.ok:
                 self.log(f"    \033[31mfailed in {res.duration}s (exit {res.code})\033[0m")
