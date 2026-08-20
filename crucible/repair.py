@@ -363,6 +363,25 @@ def _r_jvm_heap(m, plan, step):
                  }), tags=["jvm", "resources"])
 
 
+@rule(r"(useradd|groupadd|adduser|addgroup):\s*(?:user|group)\s+'?([\w.\-]+)'?\s+already exists")
+def _r_account_exists(m, plan, step):
+    """`useradd -m heroku` on an image that already has heroku.
+
+    The step's intent is "ensure this account exists" and it does; only the
+    exit code disagrees. This is the standing tax of interpreting a
+    multi-stage Dockerfile against one rootfs -- the runtime stage's setup
+    runs against the build image, which was often provisioned the same way.
+    Rewrite to the idempotent form rather than suppressing the exit code, so
+    a genuinely different useradd failure still fails.
+    """
+    tool, name = m.group(1), m.group(2)
+    probe = "getent group" if "group" in tool else "id -u"
+    old = step.cmd
+    new = f"{probe} {name} >/dev/null 2>&1 || ({old})"
+    return Patch(f"{tool}: {name} already exists -> guard on existence", 0.95,
+                 lambda p: _rewrite(p, old, new), tags=["idempotence"])
+
+
 @rule(r"(?:listening|listening on|running at|started on|bound to|server on)\D{0,24}(\d{2,5})\b")
 def _r_announced_port(m, plan, step):
     """The app said where it is. Believe it over the convention.
