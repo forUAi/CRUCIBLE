@@ -10,3 +10,8 @@ dist/
 evidence/**/*.tar.gz
 *.img
 .lima/
+
+# Local credentials. Never commit: .env holds a GitHub token in plaintext.
+.env
+.env.*
+!.env.example
