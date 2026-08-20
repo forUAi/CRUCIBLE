@@ -30,6 +30,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -38,14 +40,29 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
-# (label, path, expected outcome). Paths are guest-local on purpose: a repo on
-# a host-backed mount gets staged by containment.py, which is correct but adds
-# a copy this benchmark should not be measuring.
+# (label, path-or-git-url, expected outcome).
+#
+# External targets are FETCHED, not assumed present. They used to be absolute
+# paths under a developer home, and under the release gate -- which runs from
+# an extracted artifact with a stripped environment -- three of four targets
+# reported harness_error in 0.0s. A benchmark that only runs on the machine
+# that wrote it measures that machine.
+#
+# Pinned to exact commits: an unpinned benchmark silently changes what it is
+# measuring whenever upstream moves.
+FETCH_ROOT = Path(os.environ.get("CRUCIBLE_FIXTURES",
+                                 "/var/lib/crucible-bench-fixtures"))
 TARGETS = [
     ("python/fastapi", str(ROOT / "examples/py-fastapi"), "verified"),
-    ("node/express", "~/audit/repos/nodeapp", "verified"),
-    ("go/buildpack", "~/audit/repos/goapp", "verified"),
-    ("java/spring-maven", "~/audit/repos/petclinic", "verified"),
+    ("node/express",
+     "git:https://github.com/heroku/node-js-getting-started"
+     "@63c6674c478b697fc20a6412c78a5f7a2dcf14be", "verified"),
+    ("go/buildpack",
+     "git:https://github.com/heroku/go-getting-started"
+     "@3e3b414d3d269c6cdb7c46b5c2879c8f71ffa409", "verified"),
+    ("java/spring-maven",
+     "git:https://github.com/spring-projects/spring-petclinic"
+     "@88e37c15cf6fc8490b01bc3e8e2c800cec1ac272", "verified"),
 ]
 
 
@@ -53,6 +70,43 @@ TARGETS = [
 # printer -- which it did, losing two good results with a KeyError.
 BLANK = {"outcome": "", "seconds": 0.0, "rc": None, "attempts": 0,
          "detail": "", "run_cmd": "", "repairs": [], "status": "ok"}
+
+
+def fetch(spec: str) -> Path:
+    """Obtain an external target reproducibly.
+
+    `spec` is `url` or `url@sha`. A shallow clone is taken once and cached; a
+    pinned sha is fetched explicitly, because --depth 1 only gives the branch
+    tip and the tip moves.
+
+    A directory is not a clone: an interrupted fetch leaves one behind, and
+    returning it hands the engine an empty tree that then fails for a reason
+    that has nothing to do with the repository.
+    """
+    url, _, sha = spec.partition("@")
+    name = url.rstrip("/").split("/")[-1]
+    dest = FETCH_ROOT / name
+    if (dest / ".git").is_dir():
+        return dest
+    shutil.rmtree(dest, ignore_errors=True)
+    FETCH_ROOT.mkdir(parents=True, exist_ok=True)
+
+    r = subprocess.run(["git", "clone", "--quiet", "--filter=blob:none", url,
+                        str(dest)], capture_output=True, text=True, timeout=1800)
+    if r.returncode != 0 or not (dest / ".git").is_dir():
+        shutil.rmtree(dest, ignore_errors=True)
+        raise RuntimeError(
+            f"clone of {url} rc={r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200] or '<no output>'}")
+    if sha:
+        c = subprocess.run(["git", "-C", str(dest), "checkout", "--quiet", sha],
+                           capture_output=True, text=True, timeout=600)
+        if c.returncode != 0:
+            # Report it and keep the default branch rather than pretending the
+            # pin held. A silently unpinned benchmark is worse than a loud one.
+            print(f"  ! {name}: pinned sha {sha[:12]} unavailable "
+                  f"({(c.stderr or '').strip()[:80]}); using the branch tip")
+    return dest
 
 
 def resolve(path: str) -> Path:
@@ -79,7 +133,17 @@ def resolve(path: str) -> Path:
 
 
 def run_one(path: str, budget: int, timeout: int) -> dict:
-    target = resolve(path)
+    if path.startswith("git:"):
+        try:
+            target = fetch(path[4:])
+        except Exception as e:
+            # Infrastructure, not the repository. Keeping the real cause is
+            # the whole point: `harness_error` with no detail is what made
+            # three targets unexplainable for two gate runs.
+            return dict(BLANK, outcome="harness_error",
+                        detail=f"{type(e).__name__}: {e}"[:300])
+    else:
+        target = resolve(path)
     if not target.is_dir():
         return dict(BLANK, outcome="harness_error",
                     detail=f"target does not exist: {target}")
