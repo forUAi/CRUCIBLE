@@ -38,7 +38,21 @@ FIXTURE = ROOT / "security/fixtures/resource-probe"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
+def cold_layers() -> None:
+    """Drop the layer store so the step under test actually executes.
+
+    --no-cache disables the PLAN cache; layers are content-addressed and
+    shared on purpose. The probe's RUN command never changes, so on the second
+    case it was a snapshot hit: the step was skipped, the probe produced no
+    output, and every control read INCONCLUSIVE. A cache hit that skips the
+    operation being measured turns a resource test into a no-op.
+    """
+    import shutil
+    shutil.rmtree(STATE_ROOT / "layers", ignore_errors=True)
+
+
 def run_engine(extra: list[str], timeout: int = 1200) -> tuple[str, int, float]:
+    cold_layers()
     t0 = time.time()
     p = subprocess.run(
         [sys.executable, "-u", "-m", "crucible.cli", str(FIXTURE),
@@ -102,6 +116,13 @@ def case_processes() -> dict:
     rep = parse(out)
     after = host_snapshot()
     ok, detail = cleanup_clean(before, after)
+    if not rep:
+        return {"control": "processes/threads (cgroup pids.max)",
+                "configured": "pids.max=512", "attempted": "-",
+                "observed_peak": "-", "verdict": "INCONCLUSIVE",
+                "kernel_response": "the probe produced no output; the step was "
+                                   "skipped or died before reporting",
+                "seconds": secs, "cleanup": detail, "cleanup_ok": ok}
     threads = rep.get("threads", {})
     procs = rep.get("processes", {})
     peak = max(threads.get("started", 0), procs.get("forked", 0))
@@ -202,6 +223,7 @@ def case_goroutines() -> dict:
                 "configured": "-", "attempted": "-", "observed_peak": "-",
                 "kernel_response": "fixture missing", "cleanup": "n/a",
                 "cleanup_ok": True, "seconds": 0}
+    cold_layers()
     pr = subprocess.run(
         [sys.executable, "-u", "-m", "crucible.cli", str(gofix), "--no-llm",
          "--budget", "1", "--no-cache", "--verbose", "--mem", "512",
@@ -224,6 +246,7 @@ def case_goroutines() -> dict:
 
 def case_concurrent() -> dict:
     """Two boxes at once: one hitting a ceiling must not affect the other."""
+    cold_layers()
     before = host_snapshot()
     procs = [
         subprocess.Popen([sys.executable, "-u", "-m", "crucible.cli", str(FIXTURE),
