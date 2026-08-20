@@ -72,6 +72,12 @@ def main() -> int:
     verified, unverified, broken, unexecuted = [], [], [], []
     for i in range(0, len(blocks), 3):
         cid, title, body = blocks[i], blocks[i + 1], blocks[i + 2]
+        # Stop at the next top-level section. The LAST claim otherwise
+        # absorbs the rest of the document, so C16 read as UNVERIFIED
+        # because a later limitations section happens to use the word.
+        for sep in ("\n---\n", "\n## "):
+            if sep in body:
+                body = body.split(sep, 1)[0]
         if "UNVERIFIED" in body:
             unverified.append((cid, title))
             continue

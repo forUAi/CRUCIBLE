@@ -143,26 +143,60 @@ ASSERTS: adversarial-node::malformed_output
 EVIDENCE: `security/fixtures/hostile-python/probe.py`, `security/contain.py`
 ASSERTS: adversarial-java::credentials
 
-### C12 — Build-time egress is restricted
-**UNVERIFIED — and currently false.** Build network is unrestricted and only
-observed. `outbound_hardcoded_ip` reaches `1.1.1.1:443`; cloud metadata would
-be reachable on a cloud host. Reported as `known_policy_gap` by the harness
-rather than folded into a pass. Objective 3 addresses this.
+### C12 — Build-time egress follows the declared policy
+Build connectivity is a *policy*, not a defect. Three modes, each with a
+control in both directions: `hermetic` denies egress and the run fails naming
+the policy; `open` permits it; `proxy` routes through the operator's proxy and
+the recording proxy shows the pypi traffic; `proxy` with nothing configured
+refuses rather than falling back to a direct connection.
+
+**Not claimed:** CRUCIBLE does not stop an application dialling an IP directly
+instead of using the proxy. That is the enterprise network's control, and a
+token version here would advertise enforcement that does not exist. Under
+`open` — the default — `outbound_hardcoded_ip` reaching `1.1.1.1:443` is the
+declared behaviour, not a gap.
+EVIDENCE: `security/netmodes.py`, `crucible/netpolicy.py`
+ASSERTS: networking::hermetic_denies_and_is_named
 
 ### C13 — Process and thread counts are bounded
-**UNVERIFIED.** `pids.max` is set, but the fork probe stops at 400 — below
-the 512 cap — so it proves nothing.
+`pids.max` counts tasks, and the probe now exceeds it: 4000 threads and 2000
+forks attempted against a 512 ceiling, stopped at 508 of each.
 
-### C14 — Concurrent jobs cannot collectively exhaust the host
-**UNVERIFIED.** Each sandbox has a budget; there is no aggregate ceiling
-beyond the store size, and no test.
+**Limitation:** goroutines are not tasks. 200,000 of them multiplex onto
+GOMAXPROCS OS threads, so `pids.max` never sees them; they are bounded by
+`memory.max` instead, which is measured separately.
+EVIDENCE: `crucible/backends/namespace.py`, `security/resources.py`
+ASSERTS: resources::processes_enforced_508_of_512
+
+### C14 — Concurrent jobs are independently bounded
+Two boxes run simultaneously with separate state roots and separate cgroups:
+one at `memory.max=512 MB` allocated 448 MB, the other at 2048 MB allocated
+1984 MB, both SIGKILL(9) inside their own cgroup. Neither consumed the other's
+allocation and both runs completed.
+
+**Limitation:** this proves per-box independence, not a global ceiling. The
+only aggregate bound is the size of the shared store, and N boxes can still
+collectively fill it. There is no admission control.
+EVIDENCE: `security/resources.py`
+ASSERTS: resources::concurrent_boxes_independently_bounded
 
 ### C15 — Java, Go and Node repositories are contained as well as Python
-**UNVERIFIED.** Only a Python adversarial fixture exists. Each ecosystem has
-its own lifecycle hooks and build-plugin execution surface. Objective 2.
+Four adversarial fixtures, each probing its own ecosystem's surface: npm
+`preinstall` hooks, Go's stdlib exec/syscall/goroutines, JVM build-plugin
+execution with OS threads and no SecurityManager, and Python. Three
+repetitions each from independent fresh stores, all with non-zero probe
+counts, host clean and torn down.
+EVIDENCE: `security/fixtures/hostile-java`, `security/fixtures/hostile-go`, `security/fixtures/hostile-node`, `security/contain.py`
+ASSERTS: adversarial-java::three_repetitions_pass
 
 ### C16 — The shipped artifact behaves like the developer checkout
-**UNVERIFIED.** No release artifact has been built or tested. Objective 6.
+The gate extracts the artifact, verifies all 100 files against its manifest,
+builds a fresh venv, and runs every suite from the extracted tree with a
+stripped environment. The tree hash is recomputed afterwards, so a suite that
+mutated the artifact is caught. Contract tests read the tree they run inside,
+which under the gate is the artifact.
+EVIDENCE: `release/verify.py`, `tests/test_artifact_contract.py`
+ASSERTS: unit::artifact_contract_tests
 
 ---
 
