@@ -262,6 +262,20 @@ def case_concurrent() -> dict:
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, env=env))
     outs = [ANSI.sub("", p.communicate(timeout=1800)[0]) for p in procs]
+    # Release the private stores this case created. Leaving them mounted is
+    # the identical defect that made a 14-second benchmark take 2000 seconds;
+    # a harness that leaks while testing for leaks is worthless.
+    for i in range(len(procs)):
+        root = Path(f"/var/lib/crucible-conc-{i}")
+        if subprocess.run(f"mountpoint -q {root}", shell=True).returncode == 0:
+            dev = next((l.split()[0] for l in
+                        Path("/proc/mounts").read_text().splitlines()
+                        if len(l.split()) > 1 and l.split()[1] == str(root)), "")
+            subprocess.run(f"umount -l {root}", shell=True, capture_output=True)
+            if dev.startswith("/dev/loop"):
+                subprocess.run(f"losetup -d {dev}", shell=True, capture_output=True)
+        subprocess.run(f"rm -rf {root} {root}.img /var/lib/crucible-conc-{i}-store.img",
+                       shell=True, capture_output=True)
     after = host_snapshot()
     ok, detail = cleanup_clean(before, after)
     reps = [parse(o) for o in outs]
