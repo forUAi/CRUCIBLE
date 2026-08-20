@@ -1,0 +1,11 @@
+✓ python/fastapi         rep1  verified      15.1s  1 attempt(s)  uvicorn main:app --host 0.0.0.0 --port 8000
+✓ node/express           rep1  verified      12.7s  1 attempt(s)  node index.js
+✓ go/buildpack           rep1  verified      63.4s  2 attempt(s)  /app/bin/go-getting-started
+      repair: useradd: heroku already exists -> guard on existence
+✓ java/spring-maven      rep1  verified     475.3s  1 attempt(s)  java -jar target/spring-petclinic-4.0.0-SNAP
+────────────────────────────────────────────────────────────────────────────────────────────
+4/4 runs matched expectation   targets 4   nondeterministic: none
+  python/fastapi         ['verified']  times [15.1]
+  node/express           ['verified']  times [12.7]
+  go/buildpack           ['verified']  times [63.4]
+  java/spring-maven      ['verified']  times [475.3]

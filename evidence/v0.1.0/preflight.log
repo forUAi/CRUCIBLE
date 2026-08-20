@@ -1,0 +1,12 @@
+
+▸ containment capabilities
+  ✓ root privilege           root
+  ✓ cgroup v2 + controllers  v2 with cpu, memory, pids
+  ✓ overlayfs                supported
+  ✓ namespace tools          present
+  ✓ loop store tools         present
+  ✓ project quota stack      setquota + quota_v2
+  ✓ cgroup.kill              present
+  ✓ git                      present
+
+0 mandatory capability(ies) missing

@@ -1,0 +1,34 @@
+[
+  {
+    "mode": "hermetic",
+    "expected": "install fails, policy named",
+    "observed": "denied and failed, attributed to the policy",
+    "pass": true,
+    "rc": 1,
+    "seconds": 10.6
+  },
+  {
+    "mode": "open",
+    "expected": "install succeeds",
+    "observed": "SUCCESS",
+    "pass": true,
+    "rc": 0,
+    "seconds": 17.5
+  },
+  {
+    "mode": "proxy",
+    "expected": "install succeeds AND traffic is seen by the proxy",
+    "observed": "success=True, proxy saw ['files.pythonhosted.org:443', 'pypi.org:443']",
+    "pass": true,
+    "rc": 0,
+    "seconds": 17.7
+  },
+  {
+    "mode": "proxy (unconfigured)",
+    "expected": "refused, not a fallback",
+    "observed": "refused",
+    "pass": true,
+    "rc": 1,
+    "seconds": 0
+  }
+]

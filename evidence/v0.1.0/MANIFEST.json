@@ -1,0 +1,164 @@
+{
+  "release": "v0.1.0",
+  "source_commit": "d05a8b21116639655e26525c62ba2587cab825ad",
+  "artifact": "crucible-0.1.0.tar.gz",
+  "artifact_sha256": "db248379ee3910c8c959b51d076cbe59711b5a75ec59fc3a79318b42ae6bb6ae",
+  "evidence_bundle_sha256": "dbaf519a3958c109de05e0de6708d1e0409147e852c6279fd0441c03e4d0e64d",
+  "gate_result": "12/12 suites passed",
+  "note": "Produced by release/verify.py running against the extracted artifact in a fresh Lima VM with no host mounts.",
+  "sanitization": "Mechanical only: ANSI escapes stripped and the ephemeral mkdtemp suffix replaced. No value, verdict or timing was altered. The SHA-256 of each original file is recorded below.",
+  "files": {
+    "adversarial-go.log": {
+      "published_sha256": "4ec04ed8b5d9d3676986f38b43fa40fa9afb452fd72031a56da5d01bfa34f1f5",
+      "original_sha256": "4ec04ed8b5d9d3676986f38b43fa40fa9afb452fd72031a56da5d01bfa34f1f5",
+      "bytes": 3176,
+      "redactions": [
+        "none"
+      ]
+    },
+    "adversarial-java.log": {
+      "published_sha256": "19bf81f40c626ae34a351641d00bac01a35264fa867857a133a19ee10d30d858",
+      "original_sha256": "19bf81f40c626ae34a351641d00bac01a35264fa867857a133a19ee10d30d858",
+      "bytes": 3380,
+      "redactions": [
+        "none"
+      ]
+    },
+    "adversarial-node.log": {
+      "published_sha256": "79164610e97c5c17e7c6f542ddf27794ae238859dfe3e4afa4bc8989906dcd96",
+      "original_sha256": "79164610e97c5c17e7c6f542ddf27794ae238859dfe3e4afa4bc8989906dcd96",
+      "bytes": 2963,
+      "redactions": [
+        "none"
+      ]
+    },
+    "adversarial-python.log": {
+      "published_sha256": "f2d7a5369eb6696d541d00b68df5ec3d032de3c567c143282fe6e3ee206b7fb7",
+      "original_sha256": "f2d7a5369eb6696d541d00b68df5ec3d032de3c567c143282fe6e3ee206b7fb7",
+      "bytes": 2972,
+      "redactions": [
+        "none"
+      ]
+    },
+    "execution.json": {
+      "published_sha256": "8070f83c2ac2923c56c04fbcd20f1a2a6cb887c74ea8a5e919624dd394ba624a",
+      "original_sha256": "8070f83c2ac2923c56c04fbcd20f1a2a6cb887c74ea8a5e919624dd394ba624a",
+      "bytes": 1610,
+      "redactions": [
+        "none"
+      ]
+    },
+    "execution.log": {
+      "published_sha256": "361c520eaf5f3044a36629dd338c4c0850bc8d80c9024ee1b548ef788dcef8cb",
+      "original_sha256": "361c520eaf5f3044a36629dd338c4c0850bc8d80c9024ee1b548ef788dcef8cb",
+      "bytes": 1022,
+      "redactions": [
+        "none"
+      ]
+    },
+    "lifecycle.log": {
+      "published_sha256": "560d18b24e043ddeb4777fe710d0cd9b848a6b119258d2b0f8a78cc19692c88a",
+      "original_sha256": "14e216796e95b8a976fa321c1785a0ce721544e900d7d951738c1f886e18a5e8",
+      "bytes": 2178,
+      "redactions": [
+        "ephemeral mkdtemp suffix replaced with <runid>"
+      ]
+    },
+    "networking.json": {
+      "published_sha256": "a003008e54a3ccde16cbe1c813ddad75f103801b73d7f2546fd42e36399bf807",
+      "original_sha256": "a003008e54a3ccde16cbe1c813ddad75f103801b73d7f2546fd42e36399bf807",
+      "bytes": 743,
+      "redactions": [
+        "none"
+      ]
+    },
+    "networking.log": {
+      "published_sha256": "25f5139b4b2b2343bffc115edeb60c7019401c5f90b3ff69d2f4212892f979c6",
+      "original_sha256": "25f5139b4b2b2343bffc115edeb60c7019401c5f90b3ff69d2f4212892f979c6",
+      "bytes": 533,
+      "redactions": [
+        "none"
+      ]
+    },
+    "preflight.log": {
+      "published_sha256": "8cf043fcccf1f178a80121840228f8549d45f2ae30dcd088587bee4c3ef53193",
+      "original_sha256": "c0f8cf06dee9c36c145dedcb7b649a7a488405c4753857426619b9bf36f3e7ce",
+      "bytes": 408,
+      "redactions": [
+        "ANSI escapes stripped"
+      ]
+    },
+    "resources.json": {
+      "published_sha256": "7da6256d0bf37e990c88cf1806393ad4c1ffe043f4dec4775520c591ce0b6cb4",
+      "original_sha256": "7da6256d0bf37e990c88cf1806393ad4c1ffe043f4dec4775520c591ce0b6cb4",
+      "bytes": 2530,
+      "redactions": [
+        "none"
+      ]
+    },
+    "resources.log": {
+      "published_sha256": "a04bc8d70e64481bd7aa45627b3138c5e36a392a63447adbf254db7dfc0a1780",
+      "original_sha256": "a04bc8d70e64481bd7aa45627b3138c5e36a392a63447adbf254db7dfc0a1780",
+      "bytes": 2455,
+      "redactions": [
+        "none"
+      ]
+    },
+    "threat-model.log": {
+      "published_sha256": "3e4186e359e1f666ce7a2ec8446cf36581e97f885c6b586685cac402a589a0c4",
+      "original_sha256": "3e4186e359e1f666ce7a2ec8446cf36581e97f885c6b586685cac402a589a0c4",
+      "bytes": 64,
+      "redactions": [
+        "none"
+      ]
+    },
+    "unit.log": {
+      "published_sha256": "9f7a80d0e1ea60e8d0302d51ad38ceee9d6333ea15266469565dae66303e57a9",
+      "original_sha256": "9f7a80d0e1ea60e8d0302d51ad38ceee9d6333ea15266469565dae66303e57a9",
+      "bytes": 293,
+      "redactions": [
+        "none"
+      ]
+    },
+    "workspace-dev.log": {
+      "published_sha256": "1e3b7d5d6e9e6486e84bd88449da28f12ab65b0b5f312bfd67a038c47616740a",
+      "original_sha256": "1e3b7d5d6e9e6486e84bd88449da28f12ab65b0b5f312bfd67a038c47616740a",
+      "bytes": 2383,
+      "redactions": [
+        "none"
+      ]
+    },
+    "gate-final.json": {
+      "published_sha256": "e9aba69b7c6f98cc3ed456997ff7afba0bbfd08d17228f9c436dfa0f72ec46fa",
+      "original_sha256": "c6dba36981f52cf6f0b1428a15192cee3cedf770657680c196b9c3717297cac4",
+      "bytes": 3193,
+      "redactions": [
+        "evidence directory path replaced with a placeholder"
+      ]
+    },
+    "before-final.json": {
+      "published_sha256": "b3f60e846130318a20c6e7100f276d9ec879bcbeeef109c1e81457ec15ce21b8",
+      "original_sha256": "b3f60e846130318a20c6e7100f276d9ec879bcbeeef109c1e81457ec15ce21b8",
+      "bytes": 841,
+      "redactions": [
+        "none"
+      ]
+    },
+    "after-final.json": {
+      "published_sha256": "b3f60e846130318a20c6e7100f276d9ec879bcbeeef109c1e81457ec15ce21b8",
+      "original_sha256": "b3f60e846130318a20c6e7100f276d9ec879bcbeeef109c1e81457ec15ce21b8",
+      "bytes": 841,
+      "redactions": [
+        "none"
+      ]
+    },
+    "environment.json": {
+      "published_sha256": "217c5971fcdcf2cd6c5f190015b0aec04e053b6670ef0d3211aadc038e6a784e",
+      "original_sha256": "217c5971fcdcf2cd6c5f190015b0aec04e053b6670ef0d3211aadc038e6a784e",
+      "bytes": 254,
+      "redactions": [
+        "none"
+      ]
+    }
+  }
+}

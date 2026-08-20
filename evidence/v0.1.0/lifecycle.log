@@ -1,0 +1,26 @@
+✓ normal           clean        baseline: graceful completion
+✓ sigkill_pod      clean        SIGKILL while the pause container holds a netns
+      survived the crash: cgroup crucible-box-2d5575b8 (1 live process(es))
+      survived the crash: overlay mount /tmp/crucible-release-<runid>/state/box-2d5575b8/merged
+      survived the crash: overlay mount /tmp/crucible-release-<runid>/state/box-2d5575b8/merged/workspace
+      survived the crash: box dir /tmp/crucible-release-<runid>/state/box-2d5575b8
+      survived the crash: pod dir /tmp/crucible-release-<runid>/state/pods/pod-7cc3aae1
+      survived the crash: registry entry box-2d5575b8
+✓ sigkill_build    clean        SIGKILL during a build step, mounts live
+      survived the crash: cgroup crucible-box-5d688910 (3 live process(es))
+      survived the crash: overlay mount /tmp/crucible-release-<runid>/state/box-5d688910/merged
+      survived the crash: overlay mount /tmp/crucible-release-<runid>/state/box-5d688910/merged/workspace
+      survived the crash: box dir /tmp/crucible-release-<runid>/state/box-5d688910
+      survived the crash: registry entry box-5d688910
+✓ sigterm_pod      clean        SIGTERM while the pod is up
+      survived the crash: cgroup crucible-box-d78086ef (1 live process(es))
+      survived the crash: overlay mount /tmp/crucible-release-<runid>/state/box-d78086ef/merged
+      survived the crash: overlay mount /tmp/crucible-release-<runid>/state/box-d78086ef/merged/workspace
+      survived the crash: box dir /tmp/crucible-release-<runid>/state/box-d78086ef
+      survived the crash: pod dir /tmp/crucible-release-<runid>/state/pods/pod-a3bf548b
+      survived the crash: registry entry box-d78086ef
+✓ sigint_build     clean        SIGINT during a build step
+✓ bystander        clean        reap twice while a healthy run is live
+✓ double_reap      clean        repeated cleanup is safe
+────────────────────────────────────────────────────────────────────────────────────────
+7/7 cases clean

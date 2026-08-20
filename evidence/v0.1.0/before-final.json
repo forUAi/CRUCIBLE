@@ -1,0 +1,38 @@
+{
+  "leaks": {
+    "orphan_store_mounts": [],
+    "loop_mounts_deleted_backing": [],
+    "overlay_mounts": [],
+    "crucible_cgroups": [],
+    "box_dirs": [],
+    "pod_dirs": [],
+    "registry_records": [],
+    "release_tmpdirs": [],
+    "concurrent_state_roots": [],
+    "unattributable_netns_holders": [],
+    "escape_canaries": []
+  },
+  "warm_cache": {
+    "image_cache": {
+      "path": "/var/lib/crucible",
+      "entries": 7
+    },
+    "layer_store": {
+      "path": "/var/lib/crucible/layers",
+      "entries": 3
+    },
+    "bench_fixtures": {
+      "path": "/var/lib/crucible-bench-fixtures",
+      "entries": 3
+    },
+    "store_mount": [
+      {
+        "dev": "/dev/loop1",
+        "mount": "/var/lib/crucible",
+        "backing": "/var/lib/crucible-store.img",
+        "deleted": false,
+        "ours": true
+      }
+    ]
+  }
+}

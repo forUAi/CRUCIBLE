@@ -1,0 +1,11 @@
+{
+  "guest_os": "Ubuntu 24.04.4 LTS",
+  "kernel": "6.8.0-137-generic",
+  "arch": "aarch64",
+  "cpus": "4",
+  "mem_total_mb": 5910,
+  "cgroup": "cgroup2fs",
+  "cgroup_controllers": "cpuset cpu io memory pids",
+  "python": "3.12.3",
+  "host_mounts": "0"
+}

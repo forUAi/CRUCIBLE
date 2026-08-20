@@ -1,0 +1,22 @@
+repo                              split         ws  dep  checks  result
+────────────────────────────────────────────────────────────────────────────────────────────────
+psf/requests                                             not_fetched  
+django/django                                            not_fetched  
+Textualize/rich                                          not_fetched  
+fastapi/full-stack-fastapi-template                       not_fetched  
+netbox-community/netbox                                  not_fetched  
+apache/airflow                                           not_fetched  
+spring-projects/spring-petclinic                         not_fetched  
+spring-projects/spring-framework                         not_fetched  
+spring-guides/gs-accessing-data-jpa                       not_fetched  
+quarkusio/quarkus-quickstarts                            not_fetched  
+gin-gonic/gin                                            not_fetched  
+grpc/grpc-go                                             not_fetched  
+heroku/go-getting-started                                not_fetched  
+spf13/cobra                                              not_fetched  
+hashicorp/consul                                         not_fetched  
+heroku/node-js-getting-started                           not_fetched  
+nrwl/nx                                                  not_fetched  
+────────────────────────────────────────────────────────────────────────────────────────────────
+0/17 repositories scored   NOT FETCHED: ['psf/requests', 'django/django', 'Textualize/rich', 'fastapi/full-stack-fastapi-template', 'netbox-community/netbox', 'apache/airflow', 'spring-projects/spring-petclinic', 'spring-projects/spring-framework', 'spring-guides/gs-accessing-data-jpa', 'quarkusio/quarkus-quickstarts', 'gin-gonic/gin', 'grpc/grpc-go', 'heroku/go-getting-started', 'spf13/cobra', 'hashicorp/consul', 'heroku/node-js-getting-started', 'nrwl/nx']
+  unlabelled       0 check(s) skipped, not counted as passes

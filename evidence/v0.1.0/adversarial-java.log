@@ -1,0 +1,44 @@
+── integrity scope: guest  (running inside the VM: this proves the sandbox did not escape into the guest, which is weaker than proving it did not reach the host)
+── hostile-java run 1/3
+   probes=11 confined=True recorded=True host_clean=True torn_down=True (15.7s)  => PASS
+     · background_daemon        blocked: Cannot run program "sh": posix_spawn failed, error: 11 (Resource temporarily un
+     · build_plugin_executed    compiled and run during the build as uid 0, jdk 21.0.11
+     · credentials              {'env': [], 'paths': []}
+     · escape_workspace_write   ['WROTE /etc/crucible-java-canary', 'WROTE /root/crucible-java-canary']
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · native_library_surface   loadLibrary reachable, lookup failed: UnsatisfiedLinkError
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443 without DNS
+     · process_execution        Runtime.exec reachable: ok
+     · security_manager_gone    no SecurityManager (removed in JDK 18); nothing in-process bounds this
+     · thread_pressure          capped after 491 threads: OutOfMemoryError
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443 without DNS
+── hostile-java run 2/3
+   probes=11 confined=True recorded=True host_clean=True torn_down=True (15.6s)  => PASS
+     · background_daemon        blocked: Cannot run program "sh": posix_spawn failed, error: 11 (Resource temporarily un
+     · build_plugin_executed    compiled and run during the build as uid 0, jdk 21.0.11
+     · credentials              {'env': [], 'paths': []}
+     · escape_workspace_write   ['WROTE /etc/crucible-java-canary', 'WROTE /root/crucible-java-canary']
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · native_library_surface   loadLibrary reachable, lookup failed: UnsatisfiedLinkError
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443 without DNS
+     · process_execution        Runtime.exec reachable: ok
+     · security_manager_gone    no SecurityManager (removed in JDK 18); nothing in-process bounds this
+     · thread_pressure          capped after 491 threads: OutOfMemoryError
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443 without DNS
+── hostile-java run 3/3
+   probes=11 confined=True recorded=True host_clean=True torn_down=True (15.2s)  => PASS
+     · background_daemon        blocked: Cannot run program "sh": posix_spawn failed, error: 11 (Resource temporarily un
+     · build_plugin_executed    compiled and run during the build as uid 0, jdk 21.0.11
+     · credentials              {'env': [], 'paths': []}
+     · escape_workspace_write   ['WROTE /etc/crucible-java-canary', 'WROTE /root/crucible-java-canary']
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · native_library_surface   loadLibrary reachable, lookup failed: UnsatisfiedLinkError
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443 without DNS
+     · process_execution        Runtime.exec reachable: ok
+     · security_manager_gone    no SecurityManager (removed in JDK 18); nothing in-process bounds this
+     · thread_pressure          capped after 491 threads: OutOfMemoryError
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443 without DNS
+── repeatable across 3 run(s): True

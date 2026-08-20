@@ -1,0 +1,44 @@
+✓ processes/threads (cgroup pids.max)
+      configured       pids.max=512
+      attempted        4000 threads, 2000 forks
+      observed_peak    508 threads, 508 forks
+      kernel_response  RuntimeError after 508 threads
+      verdict          ENFORCED
+      cleanup          nothing left behind
+✓ memory (cgroup memory.max)
+      configured       memory.max=512 MB
+      attempted        16384 MB, every page touched
+      observed_peak    448 MB allocated
+      kernel_response  SIGKILL (9) inside the cgroup
+      verdict          ENFORCED
+      cleanup          nothing left behind
+✓ cpu (cgroup cpu.max)
+      configured       cpu.max=50% of one core
+      attempted        busy spin on 4 visible CPUs for 4s
+      observed_peak    0.5 core-seconds per wall-second
+      kernel_response  throttled to 0.50 cores
+      verdict          ENFORCED
+      cleanup          nothing left behind
+✓ step timeout
+      configured       --step-timeout 5s, permitted grace 1.0s
+      attempted        a build step that takes longer
+      observed_peak    step 5.03s (grace 0.03s), run 7.6s wall
+      kernel_response  step killed at 5.03s against a 5s deadline (0.03s grace, bound 1.0s); the remaining 2.6s of wall time is engine setup and teardown around the step, which the flag does not bound
+      verdict          ENFORCED
+      cleanup          nothing left behind
+! goroutines (NOT tasks)
+      configured       pids.max=512 applies to tasks only
+      attempted        200000 goroutines
+      observed_peak    4 OS threads, 90 MB heap
+      kernel_response  pids.max never sees them; they are multiplexed onto GOMAXPROCS threads
+      verdict          BOUNDED BY memory.max, not pids.max
+      cleanup          n/a
+✓ two concurrent boxes
+      configured       memory.max 512 MB and 2048 MB, separate state roots
+      attempted        both allocate 16 GB simultaneously
+      observed_peak    448 MB and 1984 MB
+      kernel_response  each box bounded by its own cgroup: 448/512 MB and 1984/2048 MB, both SIGKILL(9); neither consumed the other's allocation and both runs completed
+      verdict          ENFORCED
+      cleanup          nothing left behind
+────────────────────────────────────────────────────────────────────────────────────────
+6/6 controls enforced

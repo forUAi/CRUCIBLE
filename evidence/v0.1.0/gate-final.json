@@ -1,0 +1,120 @@
+{
+  "artifact": "/tmp/crucible-0.1.0.tar.gz",
+  "sha256": "db248379ee3910c8c959b51d076cbe59711b5a75ec59fc3a79318b42ae6bb6ae",
+  "version": "0.1.0",
+  "commit": "d05a8b21116639655e26525c62ba2587cab825ad",
+  "tree_hash_before": "b31be5c553e5d683ff26e013bf6bb83378bec71aacad688184f0c6a0c01cfc3b",
+  "tree_hash_after": "b31be5c553e5d683ff26e013bf6bb83378bec71aacad688184f0c6a0c01cfc3b",
+  "mutated": false,
+  "evidence_dir": "<evidence-dir>",
+  "suites": [
+    {
+      "suite": "preflight",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 0.0,
+      "why": "every containment capability is present before anything runs",
+      "log": "<evidence-dir>/preflight.log",
+      "tail": ""
+    },
+    {
+      "suite": "unit",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 0.1,
+      "why": "the analysis half, and every structural contract",
+      "log": "<evidence-dir>/unit.log",
+      "tail": ""
+    },
+    {
+      "suite": "threat-model",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 0.0,
+      "why": "every claimed protection resolves to something real",
+      "log": "<evidence-dir>/threat-model.log",
+      "tail": ""
+    },
+    {
+      "suite": "workspace-dev",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 0.0,
+      "why": "workspace discovery against pinned external repositories",
+      "log": "<evidence-dir>/workspace-dev.log",
+      "tail": ""
+    },
+    {
+      "suite": "lifecycle",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 62.9,
+      "why": "crash cleanup, including the bystander safety case",
+      "log": "<evidence-dir>/lifecycle.log",
+      "tail": ""
+    },
+    {
+      "suite": "execution",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 566.5,
+      "why": "four ecosystems actually build, launch and answer",
+      "log": "<evidence-dir>/execution.log",
+      "tail": ""
+    },
+    {
+      "suite": "networking",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 47.4,
+      "why": "hermetic denies egress, proxy routes through it, open permits it",
+      "log": "<evidence-dir>/networking.log",
+      "tail": ""
+    },
+    {
+      "suite": "resources",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 136.0,
+      "why": "cpu, memory, pids, disk, timeout and two concurrent boxes",
+      "log": "<evidence-dir>/resources.log",
+      "tail": ""
+    },
+    {
+      "suite": "adversarial-python",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 50.2,
+      "why": "containment",
+      "log": "<evidence-dir>/adversarial-python.log",
+      "tail": ""
+    },
+    {
+      "suite": "adversarial-node",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 42.2,
+      "why": "containment",
+      "log": "<evidence-dir>/adversarial-node.log",
+      "tail": ""
+    },
+    {
+      "suite": "adversarial-go",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 77.4,
+      "why": "containment",
+      "log": "<evidence-dir>/adversarial-go.log",
+      "tail": ""
+    },
+    {
+      "suite": "adversarial-java",
+      "outcome": "pass",
+      "rc": 0,
+      "seconds": 46.7,
+      "why": "containment",
+      "log": "<evidence-dir>/adversarial-java.log",
+      "tail": ""
+    }
+  ]
+}

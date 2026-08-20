@@ -1,0 +1,44 @@
+── integrity scope: guest  (running inside the VM: this proves the sandbox did not escape into the guest, which is weaker than proving it did not reach the host)
+── hostile-python run 1/3
+   probes=11 confined=True recorded=True host_clean=True torn_down=True (16.7s)  => PASS
+     · background_daemon        spawned detached sleep 900
+     · cloud_metadata           BLOCKED: ConnectionRefusedError: [Errno 111] Connection refused
+     · credentials              {'env': ['GPG_KEY'], 'paths': []}
+     · disk_pressure            wrote 1024 MiB inside the box
+     · escape_workspace_write   ['WROTE /etc/crucible-canary', 'WROTE /root/crucible-canary']
+     · fork_pressure            spawned 400 processes with no cap hit
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443 without DNS
+     · pid_namespace            pid=3 visible_pids=2
+     · symlink_traversal        WROTE via symlink into /etc
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443 without DNS
+── hostile-python run 2/3
+   probes=11 confined=True recorded=True host_clean=True torn_down=True (16.7s)  => PASS
+     · background_daemon        spawned detached sleep 900
+     · cloud_metadata           BLOCKED: ConnectionRefusedError: [Errno 111] Connection refused
+     · credentials              {'env': ['GPG_KEY'], 'paths': []}
+     · disk_pressure            wrote 1024 MiB inside the box
+     · escape_workspace_write   ['WROTE /etc/crucible-canary', 'WROTE /root/crucible-canary']
+     · fork_pressure            spawned 400 processes with no cap hit
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443 without DNS
+     · pid_namespace            pid=3 visible_pids=2
+     · symlink_traversal        WROTE via symlink into /etc
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443 without DNS
+── hostile-python run 3/3
+   probes=11 confined=True recorded=True host_clean=True torn_down=True (16.7s)  => PASS
+     · background_daemon        spawned detached sleep 900
+     · cloud_metadata           BLOCKED: ConnectionRefusedError: [Errno 111] Connection refused
+     · credentials              {'env': ['GPG_KEY'], 'paths': []}
+     · disk_pressure            wrote 1024 MiB inside the box
+     · escape_workspace_write   ['WROTE /etc/crucible-canary', 'WROTE /root/crucible-canary']
+     · fork_pressure            spawned 400 processes with no cap hit
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443 without DNS
+     · pid_namespace            pid=3 visible_pids=2
+     · symlink_traversal        WROTE via symlink into /etc
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443 without DNS
+── repeatable across 3 run(s): True

@@ -1,0 +1,47 @@
+── integrity scope: guest  (running inside the VM: this proves the sandbox did not escape into the guest, which is weaker than proving it did not reach the host)
+── hostile-go run 1/3
+   probes=12 confined=True recorded=True host_clean=True torn_down=True (25.7s)  => PASS
+     · background_daemon        spawned detached sleep 900
+     · build_phase_exec         spawned /usr/bin/id, uid 0
+     · cloud_metadata           blocked: dial tcp 169.254.169.254:80: connect: connection refused
+     · credentials              {'env': None, 'paths': None}
+     · escape_workspace_write   ['WROTE /etc/crucible-go-canary', 'WROTE /root/crucible-go-canary']
+     · goroutine_pressure       ran 20000 goroutines on 4 OS threads
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443 without DNS
+     · pid_namespace            pid=811 visible_pids=3
+     · raw_syscall              MOUNTED tmpfs at /mnt via raw syscall
+     · symlink_traversal        WROTE via symlink into /etc
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443 without DNS
+── hostile-go run 2/3
+   probes=12 confined=True recorded=True host_clean=True torn_down=True (25.7s)  => PASS
+     · background_daemon        spawned detached sleep 900
+     · build_phase_exec         spawned /usr/bin/id, uid 0
+     · cloud_metadata           blocked: dial tcp 169.254.169.254:80: connect: connection refused
+     · credentials              {'env': None, 'paths': None}
+     · escape_workspace_write   ['WROTE /etc/crucible-go-canary', 'WROTE /root/crucible-go-canary']
+     · goroutine_pressure       ran 20000 goroutines on 4 OS threads
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443 without DNS
+     · pid_namespace            pid=807 visible_pids=3
+     · raw_syscall              MOUNTED tmpfs at /mnt via raw syscall
+     · symlink_traversal        WROTE via symlink into /etc
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443 without DNS
+── hostile-go run 3/3
+   probes=12 confined=True recorded=True host_clean=True torn_down=True (25.7s)  => PASS
+     · background_daemon        spawned detached sleep 900
+     · build_phase_exec         spawned /usr/bin/id, uid 0
+     · cloud_metadata           blocked: dial tcp 169.254.169.254:80: connect: connection refused
+     · credentials              {'env': None, 'paths': None}
+     · escape_workspace_write   ['WROTE /etc/crucible-go-canary', 'WROTE /root/crucible-go-canary']
+     · goroutine_pressure       ran 20000 goroutines on 4 OS threads
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443 without DNS
+     · pid_namespace            pid=806 visible_pids=3
+     · raw_syscall              MOUNTED tmpfs at /mnt via raw syscall
+     · symlink_traversal        WROTE via symlink into /etc
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443 without DNS
+── repeatable across 3 run(s): True

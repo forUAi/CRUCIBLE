@@ -1,0 +1,6 @@
+✓ hermetic               denied and failed, attributed to the policy
+✓ open                   SUCCESS
+✓ proxy                  success=True, proxy saw ['files.pythonhosted.org:443', 'pypi.org:443']
+✓ proxy (unconfigured)   refused
+────────────────────────────────────────────────────────────────────────────────────
+4/4 network policies behaved as declared

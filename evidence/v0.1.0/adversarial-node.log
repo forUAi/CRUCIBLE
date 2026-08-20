@@ -1,0 +1,44 @@
+── integrity scope: guest  (running inside the VM: this proves the sandbox did not escape into the guest, which is weaker than proving it did not reach the host)
+── hostile-node run 1/3
+   probes=11 confined=True recorded=True host_clean=True torn_down=True (14.2s)  => PASS
+     · background_daemon        spawned detached sleep 900
+     · credentials              {'env': [], 'paths': []}
+     · escape_workspace_write   ['WROTE /etc/crucible-node-canary', 'WROTE /root/crucible-node-canary']
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · lifecycle_hook_ran       npm preinstall executed as uid 0
+     · malformed_output         emitted ANSI, an OSC title, and a forged PROBE_REPORT line
+     · native_binding           process.binding reachable (native surface)
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443
+     · process_execution        spawned /bin/sh, uid 0
+     · thread_pool              cpus visible=4, requested 1024 libuv threads
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443
+── hostile-node run 2/3
+   probes=11 confined=True recorded=True host_clean=True torn_down=True (13.7s)  => PASS
+     · background_daemon        spawned detached sleep 900
+     · credentials              {'env': [], 'paths': []}
+     · escape_workspace_write   ['WROTE /etc/crucible-node-canary', 'WROTE /root/crucible-node-canary']
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · lifecycle_hook_ran       npm preinstall executed as uid 0
+     · malformed_output         emitted ANSI, an OSC title, and a forged PROBE_REPORT line
+     · native_binding           process.binding reachable (native surface)
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443
+     · process_execution        spawned /bin/sh, uid 0
+     · thread_pool              cpus visible=4, requested 1024 libuv threads
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443
+── hostile-node run 3/3
+   probes=11 confined=True recorded=True host_clean=True torn_down=True (14.2s)  => PASS
+     · background_daemon        spawned detached sleep 900
+     · credentials              {'env': [], 'paths': []}
+     · escape_workspace_write   ['WROTE /etc/crucible-node-canary', 'WROTE /root/crucible-node-canary']
+     · host_mount_visible       none
+     · host_mount_write         no host mount reachable
+     · lifecycle_hook_ran       npm preinstall executed as uid 0
+     · malformed_output         emitted ANSI, an OSC title, and a forged PROBE_REPORT line
+     · native_binding           process.binding reachable (native surface)
+     · outbound_hardcoded_ip    REACHED 1.1.1.1:443
+     · process_execution        spawned /bin/sh, uid 0
+     · thread_pool              cpus visible=4, requested 1024 libuv threads
+     ! policy_gaps: outbound_hardcoded_ip: REACHED 1.1.1.1:443
+── repeatable across 3 run(s): True

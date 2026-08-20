@@ -1,0 +1,59 @@
+{
+  "rows": [
+    {
+      "outcome": "verified",
+      "seconds": 15.1,
+      "rc": 0,
+      "attempts": 1,
+      "detail": "SUCCESS  port 8000 answered   [15.1s, 1 attempt(s), 0 step(s) from cache]",
+      "run_cmd": "uvicorn main:app --host 0.0.0.0 --port 8000",
+      "repairs": [],
+      "status": "ok",
+      "target": "python/fastapi",
+      "expect": "verified",
+      "rep": 1
+    },
+    {
+      "outcome": "verified",
+      "seconds": 12.7,
+      "rc": 0,
+      "attempts": 1,
+      "detail": "SUCCESS  port 3000 answered   [12.6s, 1 attempt(s), 0 step(s) from cache]",
+      "run_cmd": "node index.js",
+      "repairs": [],
+      "status": "ok",
+      "target": "node/express",
+      "expect": "verified",
+      "rep": 1
+    },
+    {
+      "outcome": "verified",
+      "seconds": 63.4,
+      "rc": 0,
+      "attempts": 2,
+      "detail": "SUCCESS  port 8080 answered   [63.3s, 2 attempt(s), 4 step(s) from cache]",
+      "run_cmd": "/app/bin/go-getting-started",
+      "repairs": [
+        "useradd: heroku already exists -> guard on existence"
+      ],
+      "status": "ok",
+      "target": "go/buildpack",
+      "expect": "verified",
+      "rep": 1
+    },
+    {
+      "outcome": "verified",
+      "seconds": 475.3,
+      "rc": 0,
+      "attempts": 1,
+      "detail": "SUCCESS  port 8080 answered   [475.2s, 1 attempt(s), 0 step(s) from cache]",
+      "run_cmd": "java -jar target/spring-petclinic-4.0.0-SNAPSHOT.jar --server.port=8080",
+      "repairs": [],
+      "status": "ok",
+      "target": "java/spring-maven",
+      "expect": "verified",
+      "rep": 1
+    }
+  ],
+  "nondeterministic": []
+}
