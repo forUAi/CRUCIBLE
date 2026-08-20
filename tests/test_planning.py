@@ -424,3 +424,16 @@ class TestStatedPortLeads(unittest.TestCase):
             self.assertEqual(8080, p.ports[0])
             self.assertEqual(8080, p.oracle.get("port"))
             self.assertEqual("8080", p.env.get("PORT"))
+
+
+class TestImageEnvParsing(unittest.TestCase):
+    """oci.pull_rootfs normalises the config blob; read the shape it writes."""
+
+    def test_both_config_shapes(self):
+        from crucible.backends.namespace import _env_from_config
+        want = {"JAVA_HOME": "/opt/java/openjdk", "PATH": "/opt/java/openjdk/bin:/usr/bin"}
+        normalised = {"entrypoint": [], "cmd": [], "env": dict(want), "ports": []}
+        self.assertEqual(want, _env_from_config(normalised))
+        raw_oci = {"config": {"Env": [f"{k}={v}" for k, v in want.items()]}}
+        self.assertEqual(want, _env_from_config(raw_oci))
+        self.assertEqual({}, _env_from_config({}))

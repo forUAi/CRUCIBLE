@@ -158,9 +158,10 @@ class NamespaceBackend(SandboxBackend):
             # PATH; ignoring it meant ./mvnw died with "JAVA_HOME is not
             # defined correctly" on the very base chosen to provide Java.
             # pod.py already reads this for sidecars -- the app never did.
+            # oci.pull_rootfs normalises the config blob: lowercase keys and
+            # `env` already a dict.
             cfg = image_config(str(cache)) or {}
-            self.image_env = _env_list_to_dict(
-                ((cfg.get("config") or cfg.get("Config") or {}).get("Env")) or [])
+            self.image_env = _env_from_config(cfg)
             if self.image_env:
                 self.log(f"  image env: {', '.join(sorted(self.image_env))}")
 
@@ -549,10 +550,15 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
                 self.log(f"    {line}")
 
 
-def _env_list_to_dict(items) -> dict[str, str]:
-    """OCI config Env is a list of KEY=VALUE strings."""
+def _env_from_config(cfg: dict) -> dict[str, str]:
+    """ENV out of a cached image config, in either shape it can arrive in."""
+    env = cfg.get("env")
+    if isinstance(env, dict):
+        return {str(k): str(v) for k, v in env.items()}
+    raw = env if isinstance(env, list) else (
+        (cfg.get("config") or cfg.get("Config") or {}).get("Env") or [])
     out: dict[str, str] = {}
-    for item in items or []:
+    for item in raw:
         if isinstance(item, str) and "=" in item:
             k, _, v = item.partition("=")
             if k:
