@@ -196,6 +196,31 @@ def _deconflict_ports(p: RunPlan) -> None:
 _DF_CONT = re.compile(r"\\\s*\n", re.M)
 
 
+_COPY_ALL = re.compile(
+    r"^\s*(?:COPY|ADD)\s+(?:--\S+\s+)*\.{1,2}/?\s+(/\S+)", re.M | re.I)
+
+
+def _dockerfile_app_dir(text: str, final: "_Stage") -> str:
+    """The absolute directory the image treats as the application root."""
+    if m := _COPY_ALL.search(text):
+        return m.group(1).rstrip("/") or "/"
+    wd = final.workdir
+    return f"/{wd}" if wd and wd != "." else ""
+
+
+def _rebase_cwd(cwd: str, app_dir: str) -> str:
+    """Steps run under /workspace; `/app` is a symlink to it, so a WORKDIR of
+    /app is the workspace root and /app/sub is `sub` beneath it."""
+    if not app_dir:
+        return cwd
+    norm = "/" + cwd.strip("/") if cwd not in ("", ".") else "/"
+    if norm == app_dir:
+        return "."
+    if norm.startswith(app_dir.rstrip("/") + "/"):
+        return norm[len(app_dir.rstrip("/")) + 1:] or "."
+    return cwd
+
+
 class _Stage:
     """One FROM..FROM span of a Dockerfile."""
 
@@ -286,10 +311,32 @@ def _from_dockerfile(ev: Evidence) -> RunPlan | None:
     p = RunPlan()
     p.note(f"plan source: {ev.declared['dockerfile']} (interpreted, not built)")
     p.base = builder.base
-    for s in stages:                          # build-time env matters too
-        p.env.update(s.env)
+
+    # ENV is per stage in a real build: stage 2's `ENV HOME /app` never
+    # touches stage 1. Merging them made the buildpack run `git config
+    # --global` against a HOME that does not exist yet at build time.
+    p.env = dict(final.env)
+    for s in stages:
+        for st in s.steps:
+            st.env = {**s.env, **st.env}
     p.steps = [st for s in stages for st in s.steps]
-    p.workdir = final.workdir
+
+    # A Dockerfile that COPYs into /app and then WORKDIRs there is naming the
+    # application root. CRUCIBLE mounts the repo at /workspace, so every such
+    # path -- WORKDIR, HOME, the CMD itself (`/app/bin/...`) -- dangles. Alias
+    # the declared directory onto the workspace instead of rewriting paths we
+    # do not fully understand.
+    app_dir = _dockerfile_app_dir(text, final)
+    if app_dir and app_dir != "/workspace":
+        p.steps.insert(0, Step("df-appdir",
+                               f"mkdir -p $(dirname {app_dir}) && "
+                               f"rm -rf {app_dir} && ln -sfn /workspace {app_dir}",
+                               network=False, timeout=60))
+        p.note(f"aliased the image's app directory {app_dir} -> /workspace")
+        for st in p.steps:
+            st.cwd = _rebase_cwd(st.cwd, app_dir)
+
+    p.workdir = _rebase_cwd(final.workdir, app_dir) if app_dir else final.workdir
     p.run = final.run or builder.run
     p.ports = sorted({x for s in stages for x in s.ports})
 
