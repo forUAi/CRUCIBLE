@@ -70,7 +70,8 @@ class Outcome:
     elapsed: float = 0.0
     cache_hit: bool = False
     steps_skipped: int = 0
-    exhausted: bool = False     # ran out of a sandbox resource, not a repo defect
+    exhausted: bool = False
+    timed_out: bool = False     # ran out of a sandbox resource, not a repo defect
 
 
 _MANIFESTS = (
@@ -317,6 +318,23 @@ class Engine:
                     # pip's "no matching distribution" is a symptom of the
                     # policy, and the repair loop was diagnosing it as a
                     # missing wheel and rebasing the image to chase it.
+                    # A step the supervisor killed on the clock did not
+                    # fail for whatever its truncated output suggests. This
+                    # one reported `exit 0` and the repair loop diagnosed it
+                    # as an OOM kill, then raised the memory ceiling to chase
+                    # a limit that was never involved.
+                    if getattr(res, "timed_out", False):
+                        limit = getattr(step, "timeout", None)
+                        out.detail = (f"step `{step.name}` exceeded its "
+                                      f"{limit}s timeout and was killed; this "
+                                      f"is the clock, not the repository, and "
+                                      f"not a resource ceiling")
+                        att.failed_step = step.name
+                        att.diagnosis = f"timeout after {limit}s"
+                        out.timed_out = True
+                        out.attempts.append(att)
+                        self.log(f"\033[31m  ✗ {out.detail}\033[0m")
+                        break
                     if getattr(box, "_denied", {}).get(step.name):
                         out.detail = (
                             f"step `{step.name}` failed after the "

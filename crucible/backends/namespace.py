@@ -552,6 +552,11 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
             self.peers.update(sampler.peers)
 
         out = "\n".join(buf)
+        # A process we killed on the clock did not exit 0, whatever wait()
+        # reports for the shell that outlived it. Reporting 0 for a killed
+        # step is what let the repair loop read a timeout as an OOM kill.
+        if timed_out and code == 0:
+            code = 124
         ok = (code == 0 and not timed_out) or step.allow_fail
         return ExecResult(ok, code, out, "", round(time.time() - t0, 2), timed_out)
 

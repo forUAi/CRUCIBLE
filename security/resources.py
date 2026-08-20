@@ -248,14 +248,19 @@ def case_concurrent() -> dict:
     """Two boxes at once: one hitting a ceiling must not affect the other."""
     cold_layers()
     before = host_snapshot()
-    procs = [
-        subprocess.Popen([sys.executable, "-u", "-m", "crucible.cli", str(FIXTURE),
-                          "--no-llm", "--budget", "1", "--no-cache",
-                          "--mem", mem, "--step-timeout", "300"],
-                         cwd=ROOT, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True)
-        for mem in ("512", "2048")
-    ]
+    # Separate state roots. Sharing one means both race to build identical
+    # layers, the loser takes a snapshot hit, and its probe never runs -- the
+    # same cache-skip that made every control read INCONCLUSIVE.
+    procs = []
+    for i, mem in enumerate(("512", "2048")):
+        env = dict(os.environ, CRUCIBLE_STATE=f"/var/lib/crucible-conc-{i}",
+                   CRUCIBLE_IMAGES="/var/lib/crucible/images")
+        procs.append(subprocess.Popen(
+            [sys.executable, "-u", "-m", "crucible.cli", str(FIXTURE),
+             "--no-llm", "--budget", "1", "--no-cache",
+             "--mem", mem, "--step-timeout", "300"],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env))
     outs = [ANSI.sub("", p.communicate(timeout=1800)[0]) for p in procs]
     after = host_snapshot()
     ok, detail = cleanup_clean(before, after)
