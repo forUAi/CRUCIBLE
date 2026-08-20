@@ -598,9 +598,53 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         return ns + ["--net"]
 
     @staticmethod
+    def _drop_cap_sys_resource() -> None:
+        """Remove CAP_SYS_RESOURCE from the sandboxed process.
+
+        Without this a disk budget is decorative. Sandboxed builds run as uid
+        0, and `ignore_hardlimit()` in the kernel's quota code lets anything
+        holding CAP_SYS_RESOURCE write straight past a quota hard limit: a
+        200 MB write against a 64 MB project limit succeeded in full.
+
+        Dropping it is right on its own terms -- the same capability lets a
+        process raise its own rlimits and dip into the filesystem's reserved
+        blocks, both of which a sandbox should not be able to do. Nothing a
+        build legitimately needs lives behind it; mounting /proc needs
+        CAP_SYS_ADMIN, which is untouched.
+        """
+        import ctypes
+
+        CAP_SYS_RESOURCE = 24
+        PR_CAPBSET_DROP = 24
+        _LINUX_CAPABILITY_VERSION_3 = 0x20080522
+
+        libc = ctypes.CDLL(None, use_errno=True)
+
+        class Header(ctypes.Structure):
+            _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+        class Data(ctypes.Structure):
+            _fields_ = [("effective", ctypes.c_uint32),
+                        ("permitted", ctypes.c_uint32),
+                        ("inheritable", ctypes.c_uint32)]
+
+        hdr = Header(_LINUX_CAPABILITY_VERSION_3, 0)
+        data = (Data * 2)()
+        if libc.capget(ctypes.byref(hdr), ctypes.byref(data)) != 0:
+            return
+        mask = ~(1 << CAP_SYS_RESOURCE) & 0xFFFFFFFF
+        data[0].effective &= mask
+        data[0].permitted &= mask
+        data[0].inheritable &= mask
+        libc.capset(ctypes.byref(hdr), ctypes.byref(data))
+        # Out of the bounding set too, so it cannot be regained across exec.
+        libc.prctl(PR_CAPBSET_DROP, CAP_SYS_RESOURCE, 0, 0, 0)
+
+    @staticmethod
     def _child_limits() -> None:
         import resource
         os.setsid()
+        NamespaceBackend._drop_cap_sys_resource()
         try:
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             resource.setrlimit(resource.RLIMIT_NPROC, (4096, 4096))
