@@ -36,8 +36,12 @@ from pathlib import Path
 
 HOST_REPO = Path(__file__).resolve().parent.parent
 VM = "crucible"
-GUEST_CRUCIBLE = "~/audit/crucible"
-GUEST_FIXTURES = "~/audit/fixtures"
+# Derived, never hardcoded to a developer's home. The release gate runs this
+# from an extracted artifact in a temp directory, and the previous
+# "~/audit/crucible" silently pointed at a checkout that does not exist
+# there: every adversarial suite reported zero probes and INCONCLUSIVE.
+GUEST_CRUCIBLE = str(HOST_REPO)
+GUEST_FIXTURES = str(HOST_REPO / ".contain-fixtures")
 
 # Canaries live on the host. The fixtures try to write exactly these paths.
 CANARIES = {

@@ -81,8 +81,11 @@ def build(out_dir: Path) -> dict:
 
     blob = json.dumps(manifest, indent=2, sort_keys=True).encode()
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=9) as tf:
+    # gzip writes its OWN mtime into the header, so fixing tar member times
+    # was not enough: two builds of one tree produced different bytes. Drive
+    # the gzip layer explicitly with a fixed mtime.
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tf:
         def add(rel: str, data: bytes, mode: int = 0o644) -> None:
             info = tarfile.TarInfo(f"{name}/{rel}")
             info.size = len(data)
@@ -98,7 +101,12 @@ def build(out_dir: Path) -> dict:
             mode = 0o755 if f.stat().st_mode & 0o100 else 0o644
             add(rel, f.read_bytes(), mode)
 
-    data = buf.getvalue()
+    import gzip
+    packed = io.BytesIO()
+    with gzip.GzipFile(filename="", fileobj=packed, mode="wb",
+                       compresslevel=9, mtime=EPOCH) as gz:
+        gz.write(raw.getvalue())
+    data = packed.getvalue()
     tar_path.write_bytes(data)
     digest = hashlib.sha256(data).hexdigest()
     (out_dir / f"{name}.tar.gz.sha256").write_text(f"{digest}  {name}.tar.gz\n")
