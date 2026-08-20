@@ -14,8 +14,18 @@ disk: "40GiB"
 
 mountType: "virtiofs"
 mounts:
+# READ-ONLY on purpose. This mount exists so the developer can get CRUCIBLE's
+# own source into the guest; it is not where repositories are executed. A
+# writable virtiofs share is a hole straight back to the host filesystem, and
+# a sandbox whose own source tree is writable from inside the sandbox is not
+# a sandbox. Clone from here to guest-local storage before running anything.
+#
+# crucible/containment.py enforces the same rule in code: a repository whose
+# path resolves onto virtiofs/9p/sshfs/NFS is copied to guest-local storage
+# before it becomes the workspace lower layer, so this config is defence in
+# depth rather than the only control.
 - location: "~/Projects/crucible"
-  writable: true
+  writable: false
 
 # CRUCIBLE needs: overlayfs, mount/pid/net/uts/ipc namespaces, cgroup v2,
 # losetup + mkfs.ext4 for the private layer store, util-linux nsenter/unshare.

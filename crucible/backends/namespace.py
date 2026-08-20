@@ -128,6 +128,8 @@ class NamespaceBackend(SandboxBackend):
         self.peers: dict = {}               # (ip, port) -> first seen
         self.image_env: dict[str, str] = {}  # ENV declared by the base image
         self.drain_grace = 2.0              # seconds to keep reading after exit
+        self.stage_host_backed = True       # copy off host-shared storage first
+        self.staged_from: Optional[str] = None
         self._mounted = False
         self._cg: list[Path] = []
 
@@ -139,6 +141,19 @@ class NamespaceBackend(SandboxBackend):
         self.repo = Path(repo_path).resolve()
         for d in (self.layers_dir, self.merged):
             d.mkdir(parents=True, exist_ok=True)
+
+        # Untrusted code must not execute against a lower layer that lives on
+        # storage the host shares. See containment.py -- the overlay protects
+        # the tree from an honest build, not the host from a hostile one.
+        from ..containment import host_backed_mount, stage_source
+        hb = host_backed_mount(self.repo)
+        if hb and self.stage_host_backed:
+            self.log(f"  ! repo is on a host-backed mount ({hb[1]} at {hb[0]})")
+            self.staged_from = str(self.repo)
+            self.repo = stage_source(self.repo, self.dir / "src", self.log)
+        elif hb:
+            self.log(f"  !! EXECUTING AGAINST A HOST-BACKED MOUNT ({hb[1]}) -- "
+                     f"staging disabled; the host filesystem is reachable")
 
         if base in ("host", "", None):
             # Fastest path: the host rootfs is the read-only lower layer.

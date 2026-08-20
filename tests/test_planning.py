@@ -19,6 +19,7 @@ required a sandbox to detect; the plan disagreed with its own evidence.
 
 from __future__ import annotations
 
+import os
 import unittest
 from pathlib import Path
 
@@ -437,3 +438,36 @@ class TestImageEnvParsing(unittest.TestCase):
         raw_oci = {"config": {"Env": [f"{k}={v}" for k, v in want.items()]}}
         self.assertEqual(want, _env_from_config(raw_oci))
         self.assertEqual({}, _env_from_config({}))
+
+
+class TestContainmentStaging(unittest.TestCase):
+    """Untrusted code must not run against a lower layer on host-shared storage."""
+
+    def test_recognises_host_backed_filesystems(self):
+        import crucible.containment as C
+        real = C._mounts
+        try:
+            C._mounts = lambda: [("/Users/me/Projects/x", "virtiofs"), ("/", "ext4")]
+            self.assertEqual(("/Users/me/Projects/x", "virtiofs"),
+                             C.host_backed_mount("/Users/me/Projects/x/repo"))
+            self.assertIsNone(C.host_backed_mount("/home/me/repo"))
+        finally:
+            C._mounts = real
+
+    def test_staging_copies_symlinks_as_symlinks(self):
+        """Following a link would pull host content in through a link the repo
+        controls -- exactly what staging exists to prevent."""
+        import tempfile
+        from crucible.containment import stage_source
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = Path(d) / "repo", Path(d) / "staged"
+            (src / "sub").mkdir(parents=True)
+            (src / "sub/real.txt").write_text("payload")
+            (src / "escape").symlink_to("/etc/passwd")
+            (src / ".git").mkdir()
+            (src / ".git/HEAD").write_text("ref: refs/heads/main")
+            stage_source(src, dst, log=lambda *_: None)
+            self.assertEqual("payload", (dst / "sub/real.txt").read_text())
+            self.assertTrue((dst / "escape").is_symlink())
+            self.assertEqual("/etc/passwd", os.readlink(dst / "escape"))
+            self.assertFalse((dst / ".git").exists(), "vcs internals are not copied")
