@@ -211,7 +211,7 @@ Two changes, and the code one is the control:
 | Build/run policy split | **Holds.** Build steps `network=True`, run in a netns with no route out |
 | CPU / memory / pid / fd limits | **Implemented** (cgroup v2 + rlimits). Not adversarially verified |
 | Process-group termination | **Implemented** (`os.killpg`, `unshare --kill-child`). Partially verified |
-| Complete cleanup after crash or timeout | **Holds now** via the reaper. Was broken |
+| Complete cleanup after crash or timeout | **Holds, and is now proven** — see §7. The earlier claim was wrong |
 | Immutable base image / disposable VM state | **Partial.** Boxes are disposable; the VM is reused across runs |
 | No host SSH agent / cloud creds / docker socket | **Not verified.** No probe has confirmed absence |
 | Controlled allowlisted dependency proxy | **Not implemented.** Build egress is observed, not restricted |
@@ -254,7 +254,79 @@ Stated plainly. None of these are close.
 11. **Threat model documented** — this file is a start, not a threat model.
 12. **PRISM stable execution API** — **not implemented.**
 
-## 6. Honest maturity label
+## 6. Correction: the earlier cleanup claim was wrong
+
+An earlier revision of this file said cleanup after crash or timeout
+**holds**. That was inaccurate and is retracted.
+
+It was asserted from a *successful* shutdown, which proves nothing about the
+crash path — the code that tidies up is exactly the code a crash skips. The
+reaper at the time cleaned filesystem and overlay state only. A completed run
+left CRUCIBLE's `sleep 86400` pause container, holding the pod's network
+namespace, orphaned to init for several hours.
+
+Two root causes, and the second is the real one:
+
+1. `Pod.down()` kills the pause via `killpg`, and `Pod.down()` never ran.
+2. Nothing recorded that the pause **belonged** to CRUCIBLE. The reaper could
+   not have cleaned it even if it had looked, because the only way to find it
+   was to match on a process name — and `pkill -f "sleep 86400"` will kill an
+   unrelated backup script. Twice in this project a `pgrep` pattern matched
+   the inspection command that contained it.
+
+Ownership is now recorded in two places a dying process cannot forget to
+update: a **cgroup per run** (kernel-tracked membership; `cgroup.kill` is
+atomic and cannot reach a non-member) and a **run registry** naming the
+cgroup, directories and mount sources, stamped with the owner's pid *and*
+that pid's start time — pids are recycled, and a stale record pointing at a
+reused pid would otherwise authorise killing a stranger.
+
+A third defect surfaced while proving it: the property naming a box's cgroup
+had been dropped during an edit, and `getattr(box, "cgroup", "")` turned that
+missing ownership boundary into an empty string. The pod ran completely
+untracked and the only symptom was an orphan hours later. A backend that
+cannot say which processes are its own is now refused outright.
+
+## 7. Crash-cleanup evidence
+
+```bash
+sudo python3 security/lifecycle_test.py --case all                  # reap() directly
+sudo python3 security/lifecycle_test.py --case all --reap-with-run  # via a later run
+```
+
+Every case starts from a wiped environment and kills the engine in a state
+where it holds live resources. Inventory is taken by ownership evidence only
+— cgroup membership, overlay mounts whose *source* is a name only CRUCIBLE
+writes, and directories named in the registry. No process-name matching.
+
+| Case | What it kills | Survives the crash | After recovery |
+|---|---|---|---|
+| `normal` | nothing (baseline) | nothing | clean |
+| `sigkill_pod` | SIGKILL while the pause container holds a netns | cgroup + 1 live process, 2 overlays, box dir, pod dir, registry entry | **clean** |
+| `sigkill_build` | SIGKILL mid build step | cgroup + 1 live process, 2 overlays, box dir, registry entry | **clean** |
+| `sigterm_pod` | SIGTERM while the pod is up | cgroup + 1 live process, 2 overlays, box dir, pod dir, registry entry | **clean** |
+| `sigint_build` | SIGINT mid build step | nothing (handler runs) | clean |
+| `bystander` | nothing — reaps **twice while a healthy run is live** | n/a | **clean**: no live pid killed, no live mount released, the run still returned SUCCESS |
+| `double_reap` | nothing — reaps an already-clean environment twice | n/a | **clean**: no-op both times |
+
+**7/7 clean, both with `reap()` called directly and with recovery performed
+by a real later CRUCIBLE run.**
+
+Leaking *at the moment of the crash* is expected and is reported, not hidden:
+a SIGKILLed process cannot tidy up after itself. The contract is eventual
+cleanup by the next run, and that is the mechanism the second column
+exercises.
+
+The `bystander` case is the one that matters most. Cleanup that is merely
+aggressive passes every leak test and destroys production.
+
+### Still unproven here
+
+Concurrent *crashed* runs (two abandoned runs reaped in one pass), host-side
+controller interruption, and cleanup under a full disk. The reaper is written
+to handle them; they are not yet in the matrix.
+
+## 8. Honest maturity label
 
 **Working prototype with a verified execution path on four ecosystems.**
 
