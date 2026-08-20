@@ -1,0 +1,26 @@
+# Fresh release-verification VM. Same declared provisioning as .lima/crucible.yaml
+# but with NO host mount: the artifact is copied in, never imported from a checkout.
+vmType: "vz"
+os: "Linux"
+arch: "aarch64"
+images:
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+cpus: 4
+memory: "6GiB"
+disk: "40GiB"
+mountType: "virtiofs"
+mounts: []
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq python3 python3-venv util-linux e2fsprogs mount \
+                          ca-certificates curl git iproute2 procps rsync \
+                          quota linux-modules-extra-$(uname -r) >/dev/null
+    modprobe overlay || true
+    modprobe quota_v2 || true
+    stat -fc %T /sys/fs/cgroup
