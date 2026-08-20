@@ -99,10 +99,13 @@ def ensure_private_store(size_mb: int = 4096, log=print) -> None:
     have_loop = shutil.which("losetup") and shutil.which("mkfs.ext4")
     if have_loop:
         try:
+            from ..diskbudget import mkfs_options, mount_options
             if not img.exists():
                 _sh(f"truncate -s {size_mb}M {img}")
-                _sh(f"mkfs.ext4 -q -F {img}")
-            if _sh(f"mount -o loop {img} {STATE_ROOT}").returncode == 0:
+                # Project quotas have to be baked in at mkfs time; they cannot
+                # be turned on later for an image already in use.
+                _sh(f"mkfs.ext4 -q -F {mkfs_options()} {img}")
+            if _sh(f"mount -o loop,{mount_options()} {img} {STATE_ROOT}").returncode == 0:
                 log(f"  store: ext4 loop image ({size_mb} MB) at {STATE_ROOT}")
                 _STORE_READY = True
                 return
@@ -121,11 +124,15 @@ class NamespaceBackend(SandboxBackend):
     supports_snapshots = True
 
     def __init__(self, box_id: str, log=print, mem_mb: int = 2048,
-                 cpu_pct: int = 100, pid_max: int = 512, store_mb: int = 4096):
+                 cpu_pct: int = 100, pid_max: int = 512, store_mb: int = 4096,
+                 disk_mb: int = 0):
         self.id = box_id
         self.log = log
         self.mem_mb, self.cpu_pct, self.pid_max = mem_mb, cpu_pct, pid_max
         self.store_mb = store_mb
+        self.disk_mb = disk_mb              # per-sandbox writable budget
+        from ..diskbudget import BudgetState
+        self.budget = BudgetState(False, "not applied")
         self.dir = STATE_ROOT / box_id
         self.base_dir = self.dir / "base"
         # Layers are content-addressed by CHAIN hash and shared across boxes and
@@ -172,12 +179,16 @@ class NamespaceBackend(SandboxBackend):
             self.log(f"  !! EXECUTING AGAINST A HOST-BACKED MOUNT ({hb[1]}) -- "
                      f"staging disabled; the host filesystem is reachable")
 
+        # The store is always its own filesystem now, not only for --base
+        # host. It was created there to dodge overlayfs ELOOP; it is created
+        # here as well because a plain directory on / has nowhere to hang a
+        # per-sandbox disk quota, and an unenforceable budget is not a budget.
+        ensure_private_store(self.store_mb, self.log)
+
         if base in ("host", "", None):
             # Fastest path: the host rootfs is the read-only lower layer.
             # Everything the host has (compilers, apt, python) is available,
             # but every write lands in the overlay. Zero-cost "image pull".
-            # Requires the layer store to be its own mount -- see the function.
-            ensure_private_store(self.store_mb, self.log)
             self.base_dir = Path("/")
             self.log(f"  base: host rootfs (read-only lower)")
         else:
@@ -197,6 +208,13 @@ class NamespaceBackend(SandboxBackend):
             self.image_env = _env_from_config(cfg)
             if self.image_env:
                 self.log(f"  image env: {', '.join(sorted(self.image_env))}")
+
+        from ..diskbudget import apply as apply_budget
+        self.budget = apply_budget(self.dir, self.id, self.disk_mb,
+                                   STATE_ROOT, self.log)
+        if self.disk_mb and not self.budget.enforced:
+            self.log(f"  \033[33m! disk budget UNENFORCED: "
+                     f"{self.budget.reason}\033[0m")
 
         self._fresh_live()
         self._mount()

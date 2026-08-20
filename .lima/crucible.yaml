@@ -36,7 +36,11 @@ provision:
     set -eux
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
+    # `quota` is a declared dependency, not an optional extra: per-sandbox
+    # disk budgets are enforced with ext4 project quotas, and without
+    # setquota a repository can fill the store and wedge every other job.
     apt-get install -y -qq python3 python3-venv util-linux e2fsprogs mount \
-                          ca-certificates curl git iproute2 procps rsync >/dev/null
+                          ca-certificates curl git iproute2 procps rsync \
+                          quota >/dev/null
     modprobe overlay || true
     echo "cgroup version:"; stat -fc %T /sys/fs/cgroup

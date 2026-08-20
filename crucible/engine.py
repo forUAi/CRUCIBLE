@@ -143,7 +143,7 @@ class Engine:
                  base_override: Optional[str] = None,
                  store_mb: Optional[int] = None,
                  step_timeout: Optional[int] = None,
-                 verbose: bool = False):
+                 verbose: bool = False, disk_mb: int = 4096):
         self.backend_cls = backend_cls
         self.budget = budget
         self.llm = llm
@@ -156,6 +156,9 @@ class Engine:
         self.store_mb = store_mb or default_store_mb()
         self.step_timeout = step_timeout
         self.verbose = verbose
+        # A default budget, not an opt-in. An untrusted repository with no
+        # ceiling can fill the store and take every other job with it.
+        self.disk_mb = disk_mb
 
     # ------------------------------------------------------------------
 
@@ -224,7 +227,8 @@ class Engine:
         except OSError as e:
             self.log(f"  ! reaper: {e}")
         box = self.backend_cls(f"box-{uuid.uuid4().hex[:8]}", log=self.log, mem_mb=self.mem_mb,
-                               store_mb=self.store_mb)
+                               store_mb=self.store_mb,
+                               disk_mb=self.disk_mb)
         box.dns = dns
 
         # Declare ownership before creating anything. A record written after
@@ -265,7 +269,8 @@ class Engine:
                         box.destroy()
                         box = self.backend_cls(f"box-{uuid.uuid4().hex[:8]}",
                                                log=self.log, mem_mb=self.mem_mb,
-                                               store_mb=self.store_mb)
+                                               store_mb=self.store_mb,
+                               disk_mb=self.disk_mb)
                         box.dns = dns
                     box.up(plan.base, repo, plan.system_packages)
                     current_base = plan.base
@@ -354,6 +359,10 @@ class Engine:
                          f"cgroup.kill released them\033[0m")
             if record.cgroup:
                 lifecycle.cgroup_remove(record.cgroup)
+            b = getattr(box, "budget", None)
+            if b is not None and b.enforced:
+                from .diskbudget import release
+                release(b.project, STATE_ROOT)
             registry.close(run_id)
 
         out.ledger = Ledger(
