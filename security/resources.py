@@ -84,6 +84,19 @@ def parse(out: str, marker: str = "RESOURCE_REPORT") -> dict:
     return merged
 
 
+def ran_for_real(out: str) -> bool:
+    """Did the step under test actually execute in this run?
+
+    A snapshot hit skips it silently and the probe emits nothing, which is
+    indistinguishable from a limit that was never applied unless it is
+    checked explicitly. `step(s) from cache` is the engine's own count.
+    """
+    if "RESOURCE_ONE" not in out and "RESOURCE_REPORT" not in out:
+        return False
+    m = re.search(r"(\d+) step\(s\) from cache", out)
+    return not (m and int(m.group(1)) > 0)
+
+
 def host_snapshot() -> dict:
     return {
         "cgroups": sorted(g.name for g in lifecycle.CGROUP_ROOT.glob("crucible-*")),
@@ -255,9 +268,14 @@ def case_concurrent() -> dict:
     for i, mem in enumerate(("512", "2048")):
         env = dict(os.environ, CRUCIBLE_STATE=f"/var/lib/crucible-conc-{i}",
                    CRUCIBLE_IMAGES="/var/lib/crucible/images")
+        # --verbose is not cosmetic here: without it the engine never
+        # streams step output, so the probe's report lines never reach this
+        # harness. That -- not the store collision -- is why both boxes read
+        # 0 MB. A measurement harness that cannot see its own probe reports
+        # zero and calls it a result.
         procs.append(subprocess.Popen(
             [sys.executable, "-u", "-m", "crucible.cli", str(FIXTURE),
-             "--no-llm", "--budget", "1", "--no-cache",
+             "--no-llm", "--budget", "1", "--no-cache", "--verbose",
              "--mem", mem, "--step-timeout", "300"],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, env=env))
@@ -280,14 +298,41 @@ def case_concurrent() -> dict:
     ok, detail = cleanup_clean(before, after)
     reps = [parse(o) for o in outs]
     caps = [r.get("memory", {}).get("allocated_mb", 0) for r in reps]
+    kills = [r.get("memory", {}).get("killed_by_signal") for r in reps]
+    limits = [512, 2048]
+    ran = [ran_for_real(o) for o in outs]
+    both_succeeded = all("SUCCESS" in o or "EXHAUSTED" in o for o in outs)
+
+    # Measurement failure is not enforcement failure, and neither is a
+    # skipped build step. Say which one happened.
+    if not all(ran):
+        verdict, why = "MEASUREMENT_FAILED", (
+            "a box produced no probe output; its build step was skipped "
+            "(snapshot hit) or died before reporting")
+    elif not all(caps):
+        verdict, why = "MEASUREMENT_FAILED", "a box reported no allocation"
+    elif not all(k == 9 for k in kills):
+        verdict, why = "INCONCLUSIVE", "a box was not stopped by the kernel"
+    elif not all(c <= l * 1.25 for c, l in zip(caps, limits)):
+        verdict, why = "UNENFORCED", "a box exceeded its configured ceiling"
+    elif caps[0] >= caps[1]:
+        verdict, why = "UNENFORCED", (
+            "the smaller box was not bounded below the larger one, so the "
+            "limits were not independent")
+    else:
+        verdict, why = "ENFORCED", (
+            f"each box bounded by its own cgroup: {caps[0]}/{limits[0]} MB and "
+            f"{caps[1]}/{limits[1]} MB, both SIGKILL(9); neither consumed the "
+            f"other's allocation and both runs completed")
+
     return {
         "control": "two concurrent boxes",
-        "configured": "memory.max 512 MB and 2048 MB",
-        "attempted": "both allocate 16 GB",
+        "configured": "memory.max 512 MB and 2048 MB, separate state roots",
+        "attempted": "both allocate 16 GB simultaneously",
         "observed_peak": f"{caps[0]} MB and {caps[1]} MB",
-        "kernel_response": "each bounded by its own cgroup",
-        "verdict": ("ENFORCED" if caps[0] and caps[1] and caps[0] < caps[1]
-                    else "INCONCLUSIVE"),
+        "kernel_response": why,
+        "verdict": verdict,
+        "both_completed": both_succeeded,
         "seconds": 0, "cleanup": detail, "cleanup_ok": ok,
     }
 

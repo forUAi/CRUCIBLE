@@ -208,3 +208,33 @@ class TestStoreImageIsPerStateRoot(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResourceHarnessCannotReportZeroAsSuccess(unittest.TestCase):
+    """A measurement harness that cannot see its probe must say so.
+
+    The concurrent case reported `0 MB and 0 MB` and classified it
+    INCONCLUSIVE, which reads like a cautious result. It was a harness
+    defect: the run omitted --verbose, so the engine never streamed step
+    output and the probe's report lines never arrived.
+    """
+
+    def test_concurrent_case_requests_streamed_output(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "security" / "resources.py").read_text()
+        start = src.index("def case_concurrent")
+        end = src.index("CASES = {")
+        self.assertIn('"--verbose"', src[start:end],
+                      "without --verbose the probe's output never reaches the "
+                      "harness and every measurement reads zero")
+
+    def test_no_output_is_measurement_failure_not_a_verdict(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from security.resources import ran_for_real
+        self.assertFalse(ran_for_real("nothing here"))
+        self.assertFalse(
+            ran_for_real('RESOURCE_ONE {"memory": {}}\n2 step(s) from cache'),
+            "a snapshot hit means the operation under test never ran")
+        self.assertTrue(
+            ran_for_real('RESOURCE_ONE {"memory": {}}\n0 step(s) from cache'))
