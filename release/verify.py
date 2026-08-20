@@ -47,14 +47,20 @@ SUITES = [
      True, "crash cleanup, including the bystander safety case"),
     ("execution", [sys.executable, "bench/execbench.py", "--repeat", "1"],
      True, "four ecosystems actually build, launch and answer"),
-    ("adversarial-python", [sys.executable, "security/contain.py",
-                            "--run", "hostile-python"], True, "containment"),
-    ("adversarial-node", [sys.executable, "security/contain.py",
-                          "--run", "hostile-node"], True, "containment"),
-    ("adversarial-go", [sys.executable, "security/contain.py",
-                        "--run", "hostile-go"], True, "containment"),
-    ("adversarial-java", [sys.executable, "security/contain.py",
-                          "--run", "hostile-java"], True, "containment"),
+    ("networking", [sys.executable, "security/netmodes.py"], True,
+     "hermetic denies egress, proxy routes through it, open permits it"),
+    ("resources", [sys.executable, "security/resources.py", "--case", "all"],
+     True, "cpu, memory, pids, disk, timeout and two concurrent boxes"),
+    # Three repetitions each, from independent fresh stores. One passing run
+    # is a sample, not a property.
+    ("adversarial-python", [sys.executable, "security/contain.py", "--repeat",
+                            "3", "--run", "hostile-python"], True, "containment"),
+    ("adversarial-node", [sys.executable, "security/contain.py", "--repeat",
+                          "3", "--run", "hostile-node"], True, "containment"),
+    ("adversarial-go", [sys.executable, "security/contain.py", "--repeat",
+                        "3", "--run", "hostile-go"], True, "containment"),
+    ("adversarial-java", [sys.executable, "security/contain.py", "--repeat",
+                          "3", "--run", "hostile-java"], True, "containment"),
 ]
 
 
