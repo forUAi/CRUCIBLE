@@ -221,48 +221,6 @@ class NamespaceBackend(SandboxBackend):
         except OSError:
             pass
 
-
-def reap_abandoned(log=print) -> int:
-    """Unmount and delete boxes whose owning process is gone.
-
-    A run that is killed -- timeout, SIGKILL, a crash inside the engine --
-    never reaches down(), so its overlay mounts stay live and its directory
-    stays on disk. Four such boxes had accumulated 674 MB and were still
-    holding overlay mounts, which is also what pinned the loop device the
-    store lives on. Cleanup after a crash cannot be the crashing process's
-    job; it has to happen on the way in.
-    """
-    if not STATE_ROOT.is_dir():
-        return 0
-    reaped = 0
-    for d in sorted(STATE_ROOT.glob("box-*")):
-        pid_file = d / "owner.pid"
-        try:
-            pid = int(pid_file.read_text().strip())
-        except (OSError, ValueError):
-            pid = None
-        if pid is not None:
-            try:
-                os.kill(pid, 0)
-                continue                      # still running, leave it alone
-            except PermissionError:
-                continue                      # exists, owned by someone else
-            except ProcessLookupError:
-                pass
-        merged = d / "merged"
-        for target in (merged / "workspace", merged / "dev/shm", merged):
-            _sh(f"umount -l {target} 2>/dev/null")
-        shutil.rmtree(d, ignore_errors=True)
-        if not d.exists():
-            reaped += 1
-    if reaped:
-        log(f"  reaped {reaped} abandoned box(es) from earlier runs")
-    return reaped
-
-    # ------------------------------------------------------------------
-    # overlay plumbing
-    # ------------------------------------------------------------------
-
     def _fresh_live(self) -> None:
         shutil.rmtree(self.live, ignore_errors=True)
         for sub in ("root", "ws", "work-root", "work-ws"):
@@ -682,6 +640,49 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
                      f"asked for `{' '.join(pkgs)}` did not take effect")
             for line in res.tail(4).splitlines():
                 self.log(f"    {line}")
+
+
+def reap_abandoned(log=print) -> int:
+    """Unmount and delete boxes whose owning process is gone.
+
+    A run that is killed -- timeout, SIGKILL, a crash inside the engine --
+    never reaches down(), so its overlay mounts stay live and its directory
+    stays on disk. Four such boxes had accumulated 674 MB and were still
+    holding overlay mounts, which is also what pinned the loop device the
+    store lives on. Cleanup after a crash cannot be the crashing process's
+    job; it has to happen on the way in.
+    """
+    if not STATE_ROOT.is_dir():
+        return 0
+    reaped = 0
+    for d in sorted(STATE_ROOT.glob("box-*")):
+        pid_file = d / "owner.pid"
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (OSError, ValueError):
+            pid = None
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+                continue                      # still running, leave it alone
+            except PermissionError:
+                continue                      # exists, owned by someone else
+            except ProcessLookupError:
+                pass
+        merged = d / "merged"
+        for target in (merged / "workspace", merged / "dev/shm", merged):
+            _sh(f"umount -l {target} 2>/dev/null")
+        shutil.rmtree(d, ignore_errors=True)
+        if not d.exists():
+            reaped += 1
+    if reaped:
+        log(f"  reaped {reaped} abandoned box(es) from earlier runs")
+    return reaped
+
+    # ------------------------------------------------------------------
+    # overlay plumbing
+    # ------------------------------------------------------------------
+
 
 
 def _env_from_config(cfg: dict) -> dict[str, str]:
