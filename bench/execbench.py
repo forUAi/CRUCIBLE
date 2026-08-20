@@ -49,6 +49,12 @@ TARGETS = [
 ]
 
 
+# Every result carries the same keys, so a early-return path cannot crash the
+# printer -- which it did, losing two good results with a KeyError.
+BLANK = {"outcome": "", "seconds": 0.0, "rc": None, "attempts": 0,
+         "detail": "", "run_cmd": "", "repairs": [], "status": "ok"}
+
+
 def resolve(path: str) -> Path:
     """Expand ~ against the invoking user, not root.
 
@@ -58,18 +64,25 @@ def resolve(path: str) -> Path:
     does not exist is a harness error, not a repository that will not build.
     """
     import os
-    if path.startswith("~"):
-        home = (Path("/home") / os.environ["SUDO_USER"] if os.environ.get("SUDO_USER")
-                else Path.home())
-        return home / path.lstrip("~/")
-    return Path(path)
+    import pwd
+    if not path.startswith("~"):
+        return Path(path)
+    user = os.environ.get("SUDO_USER")
+    if user:
+        try:
+            # Ask the password database. Guessing /home/<user> is wrong here:
+            # this guest's home is /home/vishalchandupatla.guest.
+            return Path(pwd.getpwnam(user).pw_dir) / path.lstrip("~/")
+        except KeyError:
+            pass
+    return Path(path).expanduser()
 
 
 def run_one(path: str, budget: int, timeout: int) -> dict:
     target = resolve(path)
     if not target.is_dir():
-        return {"outcome": "harness_error", "seconds": 0.0,
-                "detail": f"target does not exist: {target}"}
+        return dict(BLANK, outcome="harness_error",
+                    detail=f"target does not exist: {target}")
     Path("/var/lib/crucible").mkdir(parents=True, exist_ok=True)
     subprocess.run("rm -rf /var/lib/crucible/layers /var/lib/crucible/plans",
                    shell=True, capture_output=True)
@@ -83,8 +96,8 @@ def run_one(path: str, budget: int, timeout: int) -> dict:
         out = ANSI.sub("", r.stdout + r.stderr)
         rc = r.returncode
     except subprocess.TimeoutExpired:
-        return {"outcome": "timeout", "seconds": round(time.time() - t0, 1),
-                "detail": f"exceeded {timeout * 3}s wall clock"}
+        return dict(BLANK, outcome="timeout", seconds=round(time.time() - t0, 1),
+                    detail=f"exceeded {timeout * 3}s wall clock")
 
     elapsed = round(time.time() - t0, 1)
     summary = next((l for l in out.splitlines()
