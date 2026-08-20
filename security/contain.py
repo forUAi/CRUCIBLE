@@ -30,8 +30,10 @@ import hashlib
 import json
 import re
 import shutil
+import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -42,7 +44,13 @@ VM = "crucible"
 # "~/audit/crucible" silently pointed at a checkout that does not exist
 # there: every adversarial suite reported zero probes and INCONCLUSIVE.
 GUEST_CRUCIBLE = str(HOST_REPO)
-GUEST_FIXTURES = str(HOST_REPO / ".contain-fixtures")
+# Staged OUTSIDE the tree under test. Putting them inside meant the harness
+# wrote into the very artifact whose integrity it was measuring: the release
+# gate reported "host file created" for each fixture and then, correctly,
+# that the artifact had been mutated by its own test run.
+GUEST_FIXTURES = os.environ.get(
+    "CRUCIBLE_CONTAIN_FIXTURES",
+    os.path.join(tempfile.gettempdir(), "crucible-contain-fixtures"))
 
 # Canaries live on the host. The fixtures try to write exactly these paths.
 CANARIES = {
