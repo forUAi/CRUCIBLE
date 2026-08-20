@@ -188,7 +188,10 @@ class Pod:
         for p in (merged, upper, work):
             p.mkdir(parents=True, exist_ok=True)
         r = subprocess.run(
-            f"mount -t overlay crucible-svc-{svc.name} -o "
+            # The source name carries the pod id: with two runs alive at
+            # once, `crucible-svc-postgres` alone does not say whose it is,
+            # and a reaper that guesses is a reaper that kills a stranger.
+            f"mount -t overlay crucible-{self.id}-svc-{svc.name} -o "
             f"lowerdir={img_dir},upperdir={upper},workdir={work} {merged}",
             shell=True, capture_output=True, text=True)
         if r.returncode != 0:

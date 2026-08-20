@@ -159,6 +159,14 @@ class Engine:
 
     # ------------------------------------------------------------------
 
+    def _own(self, path: str) -> None:
+        """Declare a directory as this run's, before anything is put in it."""
+        rec, reg = getattr(self, "_record", None), getattr(self, "_registry", None)
+        if rec is None or reg is None or path in rec.dirs:
+            return
+        rec.dirs.append(path)
+        reg.write(rec)
+
     def _require_cgroup(self, box) -> str:
         """A backend without an ownership boundary cannot be cleaned up after.
 
@@ -226,6 +234,11 @@ class Engine:
         record = registry.open(run_id, cgroup=self._require_cgroup(box))
         record.dirs = [str(box.dir)]
         registry.write(record)
+        # _verify_run creates the pod later; it must be able to declare that
+        # directory as owned too. The pod dir was the one resource the crash
+        # suite still found surviving: its mounts and its pause container were
+        # reclaimed via the cgroup, but nothing knew the directory was ours.
+        self._registry, self._record = registry, record
 
         out = Outcome(False, plan, efp, cache_hit=cache_hit)
         tried: set[str] = set()
@@ -399,6 +412,7 @@ class Engine:
             from .pod import Pod
             pod = Pod(f"pod-{uuid.uuid4().hex[:8]}", log=self.log,
                       cgroup=self._require_cgroup(box))
+            self._own(str(pod.dir))
             pod.start()
             for svc in plan.services:
                 rs = pod.launch(svc)
