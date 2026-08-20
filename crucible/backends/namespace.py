@@ -48,6 +48,11 @@ from ..schema import ExecResult, Step
 from .base import SandboxBackend
 
 STATE_ROOT = Path(os.environ.get("CRUCIBLE_STATE", "/var/lib/crucible"))
+# Pulled rootfs layers are content-addressed and immutable, so they are safe to
+# share between state roots and are legitimate warm cache. Keeping them inside
+# an ephemeral state root meant every release gate run re-pulled ~10 GB of base
+# images and then leaked the filesystem holding them.
+IMAGE_ROOT = Path(os.environ.get("CRUCIBLE_IMAGES", str(STATE_ROOT)))
 
 
 def _sh(cmd: str, check: bool = False) -> subprocess.CompletedProcess:
@@ -145,6 +150,34 @@ def ensure_private_store(size_mb: int = 4096, log=print) -> None:
         log("  ! could not create a private store -- snapshots may fail on host base")
 
 
+def release_store(log=print) -> bool:
+    """Unmount STATE_ROOT and detach its loop device.
+
+    Whoever creates an ephemeral state root has to take it down again.
+    shutil.rmtree cannot remove a mountpoint, and with ignore_errors it says
+    nothing, so a caller that just deletes its temp directory leaves a mounted
+    ~10 GB filesystem attached to a file it has already unlinked.
+    """
+    global _STORE_READY
+    if _sh(f"mountpoint -q {STATE_ROOT}").returncode != 0:
+        return False
+    dev = ""
+    try:
+        for line in Path("/proc/mounts").read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == str(STATE_ROOT):
+                dev = parts[0]
+                break
+    except OSError:
+        pass
+    _sh(f"umount -l {STATE_ROOT}")
+    if dev.startswith("/dev/loop"):
+        _sh(f"losetup -d {dev}")
+    log(f"  released store {dev or STATE_ROOT}")
+    _STORE_READY = False
+    return True
+
+
 class NamespaceBackend(SandboxBackend):
     name = "namespace"
     supports_snapshots = True
@@ -223,7 +256,7 @@ class NamespaceBackend(SandboxBackend):
             self.log(f"  base: host rootfs (read-only lower)")
         else:
             from ..oci import cache_dir_for, image_config, pull_rootfs
-            cache = cache_dir_for(STATE_ROOT, base)
+            cache = cache_dir_for(IMAGE_ROOT, base)
             self.log(f"  base: pulling {base}")
             pull_rootfs(base, str(cache), log=self.log)
             self.base_dir = cache

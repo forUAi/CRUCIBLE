@@ -255,6 +255,63 @@ def overlay_mounts_named(prefix: str = CG_PREFIX) -> list[tuple[str, str]]:
     return out
 
 
+STORE_IMG = "crucible-store.img"
+
+
+def orphaned_store_mounts() -> list[tuple[str, str, str]]:
+    """[(device, mountpoint, backing)] for store filesystems nothing can reach.
+
+    A release verification points CRUCIBLE_STATE at a private directory, so
+    ensure_private_store builds a loop-mounted ext4 image there. verify.py
+    then rmtree'd that directory while the image was still mounted:
+    shutil.rmtree cannot remove a mountpoint, ignore_errors swallowed the
+    failure, and the backing file -- which sits beside the mountpoint, not
+    under it -- was unlinked. The result is a mounted ~10 GB filesystem on a
+    deleted file that nothing will ever unmount.
+
+    Five of them had accumulated, one per release gate run, holding 5 GB of
+    page cache in a 6 GiB VM and provoking seven OOM kills. That is what made
+    a 14-second benchmark take 2000 seconds.
+
+    Ownership is exact on two counts: the backing file carries a name only
+    CRUCIBLE writes, and the kernel reports it as deleted, so no live
+    configuration can still refer to it.
+    """
+    out = []
+    try:
+        mounts = Path("/proc/mounts").read_text().splitlines()
+    except OSError:
+        return out
+    for line in mounts:
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].startswith("/dev/loop"):
+            continue
+        dev = parts[0]
+        backing = _loop_backing(dev)
+        if STORE_IMG in backing and backing.endswith("(deleted)"):
+            out.append((dev, parts[1].encode().decode("unicode_escape"), backing))
+    return out
+
+
+def _loop_backing(dev: str) -> str:
+    name = dev.rsplit("/", 1)[-1]
+    try:
+        return Path(f"/sys/block/{name}/loop/backing_file").read_text().strip()
+    except OSError:
+        return ""
+
+
+def reclaim_store_mounts(log=print) -> int:
+    """Unmount and detach store filesystems whose image is already deleted."""
+    n = 0
+    for dev, mp, backing in orphaned_store_mounts():
+        _sh(f"umount -l {mp}")
+        _sh(f"losetup -d {dev}")
+        log(f"  reclaimed orphaned store {dev} at {mp} ({backing})")
+        n += 1
+    return n
+
+
 @dataclass
 class ReapReport:
     runs_examined: int = 0
@@ -264,19 +321,23 @@ class ReapReport:
     mounts_released: int = 0
     dirs_removed: int = 0
     skipped_live: int = 0
+    stores_reclaimed: int = 0
     errors: list[str] = field(default_factory=list)
 
     def anything(self) -> bool:
-        return bool(self.runs_reaped or self.processes_killed
+        return bool(self.stores_reclaimed or self.runs_reaped
+                    or self.processes_killed
                     or self.cgroups_removed or self.mounts_released
                     or self.dirs_removed)
 
     def summary(self) -> str:
+        extra = (f", {self.stores_reclaimed} orphaned store mount(s)"
+                 if self.stores_reclaimed else "")
         return (f"reaped {self.runs_reaped} abandoned run(s): "
                 f"{self.processes_killed} process(es), "
                 f"{self.cgroups_removed} cgroup(s), "
                 f"{self.mounts_released} mount(s), "
-                f"{self.dirs_removed} dir(s)")
+                f"{self.dirs_removed} dir(s)" + extra)
 
 
 def reap(state_root: Path, log=print, dry_run: bool = False) -> ReapReport:
@@ -332,6 +393,12 @@ def reap(state_root: Path, log=print, dry_run: bool = False) -> ReapReport:
                 continue                       # somebody is in there; leave it
             cgroup_remove(g.name)
             rep.cgroups_removed += 1
+
+    # Store filesystems are not owned by any single run -- they outlive every
+    # one of them -- so they are reclaimed by evidence rather than by
+    # registry lookup.
+    if not dry_run:
+        rep.stores_reclaimed = reclaim_store_mounts(lambda *_: None)
 
     if rep.anything():
         log(f"  {rep.summary()}")

@@ -106,9 +106,43 @@ def clean_env(state_root: Path) -> dict:
         "HOME": str(home),
         "LANG": "C.UTF-8",
         "CRUCIBLE_STATE": str(state_root / "state"),
+        # Shared, and deliberately not the developer's home: immutable pulled
+        # layers are legitimate warm cache, and rebuilding them inside each
+        # ephemeral state root cost ~10 GB and most of the gate's runtime.
+        "CRUCIBLE_IMAGES": os.environ.get("CRUCIBLE_IMAGES",
+                                          "/var/lib/crucible-release-images"),
         "CRUCIBLE_CACHE": str(home / ".crucible" / "plans.json"),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
+
+
+def teardown(workdir: Path, env: dict, keep: bool) -> None:
+    """Release the state root before deleting the directory that holds it.
+
+    rmtree cannot remove a mountpoint and, with ignore_errors, does not say
+    so. Five gate runs each left a loop-mounted ext4 image behind, on a
+    backing file rmtree had already unlinked: 5 GB of page cache in a 6 GiB
+    VM, seven OOM kills, and a 14-second benchmark taking 2000 seconds.
+    """
+    state = Path(env["CRUCIBLE_STATE"])
+    if subprocess.run(f"mountpoint -q {state}", shell=True).returncode == 0:
+        dev = ""
+        for line in Path("/proc/mounts").read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == str(state):
+                dev = parts[0]
+                break
+        subprocess.run(f"umount -l {state}", shell=True, capture_output=True)
+        if dev.startswith("/dev/loop"):
+            subprocess.run(f"losetup -d {dev}", shell=True, capture_output=True)
+        print(f"released state store {dev or state}")
+    if keep:
+        print(f"kept {workdir}")
+        return
+    shutil.rmtree(workdir, ignore_errors=True)
+    if workdir.exists():
+        print(f"  ! {workdir} survived removal; something is still mounted "
+              f"inside it")
 
 
 def main() -> int:
@@ -203,10 +237,7 @@ def main() -> int:
              "version": manifest["version"], "commit": manifest["source_commit"],
              "tree_hash_before": before, "tree_hash_after": after,
              "mutated": mutated, "suites": results}, indent=2) + "\n")
-    if not a.keep:
-        shutil.rmtree(workdir, ignore_errors=True)
-    else:
-        print(f"kept {workdir}")
+    teardown(workdir, env, a.keep)
 
     return 1 if (failed or skipped or mutated) else 0
 

@@ -68,6 +68,12 @@ def cache_dir_for(root, ref: str, arch: str | None = None) -> Path:
     return Path(root) / "images" / f"{slug}@linux-{a}{'-' + v if v else ''}"
 
 
+def image_cache_root() -> Path:
+    """Where pulled rootfs layers live. Shared on purpose -- see IMAGE_ROOT."""
+    from .backends.namespace import IMAGE_ROOT
+    return IMAGE_ROOT
+
+
 def _pick_manifest(index: dict, ref: str, arch: str, variant: str) -> str:
     """Choose the digest for our platform out of a manifest list.
 
