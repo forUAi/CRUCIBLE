@@ -92,8 +92,12 @@ def guest(script: str, timeout: int = 900) -> subprocess.CompletedProcess:
 def host_snapshot() -> dict:
     """Everything about the host this run is forbidden to change."""
     files = {}
+    # __pycache__ is created by running the code under test and says nothing
+    # about containment. Counting it made the release gate report a host
+    # escape for bytecode the gate itself had just caused.
+    NOISE = {".git", "__pycache__", ".pytest_cache"}
     for p in sorted(HOST_REPO.rglob("*")):
-        if ".git" in p.parts or not p.is_file():
+        if (set(p.parts) & NOISE) or not p.is_file():
             continue
         try:
             files[str(p.relative_to(HOST_REPO))] = hashlib.sha256(
