@@ -48,13 +48,26 @@ def run_engine(extra: list[str], timeout: int = 1200) -> tuple[str, int, float]:
 
 
 def parse(out: str, marker: str = "RESOURCE_REPORT") -> dict:
+    """Merge every incremental line, then the final summary if it arrived.
+
+    The summary is written last and is therefore the first casualty of the
+    OOM kill the memory probe is designed to provoke. Reading the per-control
+    lines means a kill can only destroy the finding that caused it.
+    """
+    merged: dict = {}
     for line in out.splitlines():
-        if marker in line:
+        if "RESOURCE_ONE" in line:
             try:
-                return json.loads(line.split(marker, 1)[1].strip())
+                merged.update(json.loads(line.split("RESOURCE_ONE", 1)[1].strip()))
             except ValueError:
-                continue
-    return {}
+                pass
+    for line in out.splitlines():
+        if marker in line and "RESOURCE_ONE" not in line:
+            try:
+                merged.update(json.loads(line.split(marker, 1)[1].strip()))
+            except ValueError:
+                pass
+    return merged
 
 
 def host_snapshot() -> dict:
@@ -159,13 +172,17 @@ def case_cpu(pct: int = 50) -> dict:
 def case_timeout() -> dict:
     """A step that outruns its clock must be stopped and reported as such."""
     before = host_snapshot()
-    out, _rc, secs = run_engine(["--step-timeout", "20", "--mem", "2048"], timeout=600)
+    # 5s against a probe whose CPU case alone spins for 4s and whose thread
+    # and memory cases add more. A timeout test whose step finishes in time
+    # measures nothing, which is what "7.6s wall against a 20s limit" was.
+    out, _rc, secs = run_engine(["--step-timeout", "5", "--mem", "2048"], timeout=600)
     after = host_snapshot()
     ok, detail = cleanup_clean(before, after)
-    timed = "timed out" in out.lower() or "timeout" in out.lower()
+    timed = ("timed out" in out.lower() or "timeout" in out.lower()
+             or "exit 124" in out.lower())
     return {
         "control": "step timeout",
-        "configured": "--step-timeout 20s",
+        "configured": "--step-timeout 5s",
         "attempted": "a build step that takes longer",
         "observed_peak": f"{secs}s wall",
         "kernel_response": "SIGKILL to the process group by the supervisor",
@@ -176,13 +193,22 @@ def case_timeout() -> dict:
 
 def case_goroutines() -> dict:
     """Goroutines are not tasks. State which control actually bounds them."""
-    go = FIXTURE / "goroutines.go"
-    if not go.exists():
+    # Measured inside a sandbox, on a base that carries a Go toolchain. The
+    # host has none, and running it on the host would answer a different
+    # question anyway -- the point is which cgroup control bounds goroutines.
+    gofix = ROOT / "security/fixtures/goroutine-probe"
+    if not (gofix / "Dockerfile").exists():
         return {"control": "goroutines", "verdict": "INCONCLUSIVE",
-                "kernel_response": "fixture missing"}
-    p = subprocess.run(["go", "run", str(go)], capture_output=True, text=True,
-                       timeout=600, cwd=str(FIXTURE))
-    rep = parse(p.stdout + p.stderr, "GOROUTINE_REPORT")
+                "configured": "-", "attempted": "-", "observed_peak": "-",
+                "kernel_response": "fixture missing", "cleanup": "n/a",
+                "cleanup_ok": True, "seconds": 0}
+    pr = subprocess.run(
+        [sys.executable, "-u", "-m", "crucible.cli", str(gofix), "--no-llm",
+         "--budget", "1", "--no-cache", "--verbose", "--mem", "512",
+         "--step-timeout", "600"],
+        cwd=ROOT, capture_output=True, text=True, timeout=1800)
+    out = ANSI.sub("", pr.stdout + pr.stderr)
+    rep = parse(out, "GOROUTINE_REPORT")
     return {
         "control": "goroutines (NOT tasks)",
         "configured": "pids.max=512 applies to tasks only",

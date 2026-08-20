@@ -27,6 +27,18 @@ def emit() -> None:
     print("RESOURCE_REPORT " + json.dumps(REPORT), flush=True)
 
 
+def emit_one(name: str, data: dict) -> None:
+    """One line per control, as soon as it is known.
+
+    A single report at the end is lost the moment the kernel OOM-kills
+    anything in the cgroup -- which is precisely the event the memory probe
+    exists to observe. Emitting incrementally means a kill can only ever
+    destroy the finding that caused it.
+    """
+    REPORT[name] = data
+    print("RESOURCE_ONE " + json.dumps({name: data}), flush=True)
+
+
 def in_child(name: str, fn) -> None:
     """Run a probe that may be killed, and keep its findings.
 
@@ -68,14 +80,22 @@ def in_child(name: str, fn) -> None:
     if sig:
         REPORT[name]["killed_by_signal"] = sig
     REPORT[name]["exit_status"] = status >> 8
+    emit_one(name, REPORT[name])
 
 
 # --------------------------------------------------------------------------
 
-def probe_memory() -> dict:
-    """Allocate until refused. Touch every page: a lazy allocation is not a
-    consumption, and a limit that only fires on touch would look absent."""
-    chunks, mb = [], 0
+def probe_memory(progress=None) -> dict:
+    """Allocate until refused, touching every page.
+
+    A lazy allocation is not a consumption, and under memory.max the kernel
+    does not politely return MemoryError -- it SIGKILLs. So the running total
+    is streamed to the parent after every block: when the kill lands, the
+    last number written is the observed peak. Without that the probe dies
+    silently and an enforced limit is indistinguishable from an absent one.
+    """
+    mb = 0
+    chunks = []
     stopped = None
     try:
         while mb < 16384:
@@ -84,7 +104,9 @@ def probe_memory() -> dict:
                 block[off] = 1
             chunks.append(block)
             mb += 64
-    except MemoryError as e:
+            if progress:
+                progress(mb)
+    except MemoryError:
         stopped = f"MemoryError after {mb} MB"
     except OSError as e:
         stopped = f"OSError {e.errno} after {mb} MB"
@@ -137,18 +159,23 @@ def probe_cpu() -> dict:
     process cannot read its own cgroup, and `nproc` reports the machine, not
     the allowance.
     """
+    # Processes, not threads: the GIL serialises CPU-bound Python, so a
+    # threaded spinner reports 1.0 cores on any machine and cannot tell a
+    # 50% quota from an unlimited one.
     n = os.cpu_count() or 1
-    wall0, cpu0 = time.time(), time.process_time()
+    wall0 = time.time()
     stop = time.time() + 4.0
-    ts = []
+    kids = []
     for _ in range(n):
-        t = threading.Thread(target=_spin, args=(stop,), daemon=True)
-        t.start()
-        ts.append(t)
-    for t in ts:
-        t.join(20)
+        pid = os.fork()
+        if pid == 0:
+            _spin(stop)
+            os._exit(0)
+        kids.append(pid)
+    for pid in kids:
+        os.waitpid(pid, 0)
     wall = time.time() - wall0
-    usage = resource.getrusage(resource.RUSAGE_SELF)
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu = usage.ru_utime + usage.ru_stime
     return {"visible_cpus": n, "wall_seconds": round(wall, 2),
             "cpu_seconds": round(cpu, 2),
@@ -160,6 +187,59 @@ def _spin(until: float) -> None:
     while time.time() < until:
         for _ in range(20000):
             x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+
+
+def in_child_streaming(name: str, fn) -> None:
+    """Like in_child, but the child streams progress line by line.
+
+    The last line received before the kill is the observed peak.
+    """
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+
+        def progress(mb: int) -> None:
+            try:
+                os.write(w, (json.dumps({"allocated_mb": mb}) + "\n").encode())
+            except OSError:
+                pass
+        out = {}
+        try:
+            out = fn(progress)
+        except BaseException as e:            # noqa: BLE001
+            out = {"stopped": f"{type(e).__name__}: {str(e)[:80]}"}
+        try:
+            os.write(w, (json.dumps(dict(out, final=True)) + "\n").encode())
+        except OSError:
+            pass
+        os._exit(0)
+    os.close(w)
+    last: dict = {}
+    buf = b""
+    while True:
+        try:
+            b = os.read(r, 65536)
+        except OSError:
+            break
+        if not b:
+            break
+        buf += b
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            try:
+                last.update(json.loads(line))
+            except ValueError:
+                pass
+    os.close(r)
+    _, status = os.waitpid(pid, 0)
+    sig = status & 0x7F
+    if sig:
+        last["killed_by_signal"] = sig
+        last.setdefault("stopped", f"SIGKILL after {last.get('allocated_mb', 0)} MB")
+    last["exit_status"] = status >> 8
+    last.setdefault("attempted_mb", 16384)
+    emit_one(name, last)
 
 
 def probe_background_child() -> dict:
@@ -184,7 +264,7 @@ def main() -> int:
     if only in ("all", "processes"):
         in_child("processes", probe_processes)
     if only in ("all", "memory"):
-        in_child("memory", probe_memory)
+        in_child_streaming("memory", probe_memory)
     if only in ("all", "background"):
         in_child("background", probe_background_child)
 
