@@ -170,6 +170,23 @@ class Engine:
         rec.dirs.append(path)
         reg.write(rec)
 
+    # 128+SIGXFSZ from a shell, or the raw signal from a direct exec.
+    _FSIZE_CODES = {153, -25}
+    _QUOTA_TEXT = ("Disk quota exceeded", "EDQUOT", "No space left on device",
+                   "File size limit exceeded")
+
+    def _hit_disk_budget(self, box, res) -> bool:
+        b = getattr(box, "budget", None)
+        if b is None or not b.enforced:
+            return False
+        if res.code in self._FSIZE_CODES:
+            return True
+        if any(s in res.log for s in self._QUOTA_TEXT):
+            return True
+        from .diskbudget import usage_mb
+        used = usage_mb(b.project, STATE_ROOT)
+        return used is not None and used >= b.limit_mb * 0.95
+
     def _require_cgroup(self, box) -> str:
         """A backend without an ownership boundary cannot be cleaned up after.
 
@@ -281,6 +298,23 @@ class Engine:
 
                 if failed is not None:
                     step, res = failed
+                    # Distinguish "this repository is broken" from "this
+                    # sandbox ran out of its allowance". They are not the same
+                    # result and must not be reported as the same one. A disk
+                    # bomb is killed by SIGXFSZ or refused with EDQUOT, and
+                    # either way the previous message was just "unrepairable
+                    # failure", which tells an operator nothing actionable.
+                    if self._hit_disk_budget(box, res):
+                        b = box.budget
+                        out.detail = (f"disk budget exceeded: the sandbox was "
+                                      f"capped at {b.limit_mb} MB and the build "
+                                      f"tried to write past it")
+                        out.exhausted = True
+                        att.failed_step = step.name
+                        att.diagnosis = "disk budget exceeded"
+                        out.attempts.append(att)
+                        self.log(f"\033[31m  ✗ {out.detail}\033[0m")
+                        break
                     att.failed_step = step.name
                     patch = repair_mod.diagnose(res, plan, step, llm=self.llm, seen=diagnosed)
                     att.duration = round(time.time() - a0, 1)
