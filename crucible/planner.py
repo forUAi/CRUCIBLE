@@ -196,17 +196,45 @@ def _deconflict_ports(p: RunPlan) -> None:
 _DF_CONT = re.compile(r"\\\s*\n", re.M)
 
 
+class _Stage:
+    """One FROM..FROM span of a Dockerfile."""
+
+    def __init__(self, base: str, alias: str = ""):
+        self.base, self.alias = base, alias
+        self.steps: list[Step] = []
+        self.env: dict[str, str] = {}
+        self.ports: list[int] = []
+        self.workdir = "."
+        self.run = ""
+
+
 def _from_dockerfile(ev: Evidence) -> RunPlan | None:
+    """Interpret a Dockerfile as a plan.
+
+    Multi-stage needs real handling, not flattening. The previous reading took
+    the *final* FROM as the base -- "multi-stage builds end at the runtime
+    image" -- while still executing every earlier stage's RUN steps on it. But
+    the entire purpose of a multi-stage build is that the runtime image does
+    NOT contain the toolchain: heroku/heroku:24 has no git and no compiler,
+    heroku/heroku:24-build has both. Running the builder's steps against the
+    runtime base fails with `command not found` for tools the author was
+    careful to provide, and the repair loop cannot fix a base that was chosen
+    wrong.
+
+    CRUCIBLE has one rootfs, so the coherent choice is the opposite: execute
+    on the stage whose base was built to satisfy the RUN steps, and take the
+    runtime directives -- CMD, EXPOSE, USER -- from the final stage. The
+    `COPY --from=build` that stitches them together is already satisfied,
+    because in one filesystem the artifact never left.
+    """
     path = Path(ev.root) / ev.declared["dockerfile"]
     try:
         text = _DF_CONT.sub(" ", path.read_text(errors="replace"))
     except OSError:
         return None
 
-    p = RunPlan()
-    p.note(f"plan source: {ev.declared['dockerfile']} (interpreted, not built)")
-    stages: list[str] = []
-    workdir = "."
+    stages: list[_Stage] = []
+    cur: _Stage | None = None
     n = 0
 
     for raw in text.splitlines():
@@ -217,38 +245,81 @@ def _from_dockerfile(ev: Evidence) -> RunPlan | None:
         instr, rest = instr.upper(), rest.strip()
 
         if instr == "FROM":
-            img = rest.split(" AS ")[0].split(" as ")[0].strip()
-            stages.append(img)
-            # last stage wins -- multi-stage builds end at the runtime image
-            p.base = img
-        elif instr == "RUN":
+            head = re.split(r"\s+[Aa][Ss]\s+", rest)
+            img = head[0].strip()
+            alias = head[1].strip() if len(head) > 1 else ""
+            cur = _Stage(img, alias)
+            stages.append(cur)
+            continue
+        if cur is None:                      # directives before any FROM
+            continue
+
+        if instr == "RUN":
             n += 1
-            p.steps.append(Step(f"df-run-{n}", rest, network=True, cwd=workdir))
+            cur.steps.append(Step(f"df-run-{n}", rest, network=True, cwd=cur.workdir))
         elif instr == "WORKDIR":
-            workdir = rest.strip("/") or "."
-            p.workdir = workdir
-        elif instr in ("ENV",):
+            cur.workdir = rest.strip("/") or "."
+        elif instr == "ENV":
             for k, v in _kv(rest):
-                p.env[k] = v
+                cur.env[k] = v
         elif instr == "ARG":
             k, _, v = rest.partition("=")
             if v:
-                p.env.setdefault(k.strip(), v.strip().strip('"\''))
+                cur.env.setdefault(k.strip(), v.strip().strip('"\''))
         elif instr == "EXPOSE":
             for tok in rest.split():
                 num = tok.split("/")[0]
                 if num.isdigit():
-                    p.ports.append(int(num))
+                    cur.ports.append(int(num))
         elif instr in ("CMD", "ENTRYPOINT"):
-            p.run = _joinexec(rest) if instr == "CMD" or not p.run else f"{_joinexec(rest)} {p.run}"
+            cur.run = (_joinexec(rest) if instr == "CMD" or not cur.run
+                       else f"{_joinexec(rest)} {cur.run}")
+
+    if not stages:
+        return None
+    final = stages[-1]
+
+    # The base has to satisfy the steps we are going to run. With one rootfs
+    # that means the first stage that actually builds something.
+    builder = next((s for s in stages if s.steps), final)
+
+    p = RunPlan()
+    p.note(f"plan source: {ev.declared['dockerfile']} (interpreted, not built)")
+    p.base = builder.base
+    for s in stages:                          # build-time env matters too
+        p.env.update(s.env)
+    p.steps = [st for s in stages for st in s.steps]
+    p.workdir = final.workdir
+    p.run = final.run or builder.run
+    p.ports = sorted({x for s in stages for x in s.ports})
 
     if len(stages) > 1:
-        p.note(f"multi-stage ({len(stages)} stages) -- flattened, using final base {p.base}")
+        p.note(f"multi-stage ({len(stages)} stages); executing on `{builder.base}`"
+               + (f" (stage {builder.alias})" if builder.alias else "")
+               + f", runtime directives from `{final.base}`")
+        if builder.base != final.base:
+            p.note("single rootfs: the runtime image lacks the toolchain by "
+                   "design, so the build stage is the executable base")
+
     if not p.run:
         return None
-    p.ports = sorted(set(p.ports)) or _app_ports(ev)
+
+    if not p.ports:
+        # No EXPOSE is silence about ports, not an assertion that there are
+        # none. Fall back to observed ports, then to the framework default.
+        p.ports = _app_ports(ev)
+        if not p.ports:
+            fw = ev.top("framework")
+            lang = ev.top("language") or ""
+            if fw and fw in FRAMEWORKS and _framework_implies_app(ev, fw, lang):
+                arch, port, _ = FRAMEWORKS[fw]
+                if arch == "web" and port:
+                    p.ports = [port]
+                    p.note(f"no EXPOSE; port {port} from framework {fw}")
+
     p.archetype = "web" if p.ports else "cli"
-    p.oracle = {"kind": "http" if p.ports else "exit0", "port": p.ports[0] if p.ports else 0}
+    p.oracle = ({"kind": "http", "port": p.ports[0], "path": "/", "grace": 45}
+                if p.ports else {"kind": "exit0"})
     return p
 
 
