@@ -312,6 +312,56 @@ def reclaim_store_mounts(log=print) -> int:
     return n
 
 
+def unattributable_netns(state_root: Path) -> list[dict]:
+    """Live processes holding a private netns that no run record explains.
+
+    A pause container from a run that predates this registry cannot be
+    reclaimed: there is no cgroup naming it and no record listing it, and
+    killing `sleep 86400` by name would take out somebody's backup script.
+    One such process survived here for nearly three hours while every
+    diagnostic stayed silent about it.
+
+    So it is REPORTED instead, with the evidence needed to act on it by hand:
+    pid, start time, the namespace held, and the working directory. That
+    satisfies the rule that every surviving resource is attributable to an
+    active run, to intentional cache state, or to a clearly reported defect --
+    this is the third kind.
+    """
+    known = {r.cgroup for r in Registry(state_root).load_all() if r.alive()}
+    try:
+        init_net = os.readlink("/proc/1/ns/net")
+    except OSError:
+        return []
+    out = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            net = os.readlink(f"/proc/{pid}/ns/net")
+            if net == init_net:
+                continue
+            cg = Path(f"/proc/{pid}/cgroup").read_text().strip()
+            if any(k and k in cg for k in known) or CG_PREFIX in cg:
+                continue                      # a live run already owns it
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+        except OSError:
+            continue
+        # Report only what plausibly came from here: a private netns AND a
+        # working directory inside a CRUCIBLE tree. Neither alone is enough,
+        # and neither is a licence to kill it.
+        if "crucible" not in cwd.lower():
+            continue
+        out.append({"pid": pid, "comm": comm, "netns": net, "cwd": cwd,
+                    "starttime": pid_starttime(pid), "cgroup": cg})
+    return out
+
+
 @dataclass
 class ReapReport:
     runs_examined: int = 0
@@ -400,6 +450,16 @@ def reap(state_root: Path, log=print, dry_run: bool = False) -> ReapReport:
     if not dry_run:
         rep.stores_reclaimed = reclaim_store_mounts(lambda *_: None)
 
-    if rep.anything():
+    # Reported, never auto-killed: there is no ownership evidence for these,
+    # and acting without it is how a reaper kills a stranger.
+    for o in unattributable_netns(state_root):
+        rep.errors.append(
+            f"unattributable netns holder: pid={o['pid']} comm={o['comm']!r} "
+            f"ns={o['netns']} cwd={o['cwd']} -- predates run ownership or its "
+            f"record was lost; verify and remove by hand")
+
+    if rep.anything() or rep.errors:
         log(f"  {rep.summary()}")
+        for e in rep.errors:
+            log(f"  ! {e}")
     return rep
