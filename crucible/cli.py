@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 
 from . import lint as lint_mod
@@ -83,6 +84,10 @@ def main(argv=None) -> int:
                     help="leave network up during run (default: cut it)")
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--no-llm", action="store_true", help="deterministic repairs only")
+    ap.add_argument("--workspaces", action="store_true",
+                    help="discover the workspace graph and plan each runnable "
+                         "component separately, instead of assuming the root "
+                         "is the application")
     ap.add_argument("--plan-only", action="store_true", help="analyze and print, do not execute")
     ap.add_argument("--lint-strict", action="store_true",
                     help="exit non-zero if the plan contradicts its own evidence")
@@ -92,6 +97,9 @@ def main(argv=None) -> int:
     repo = _clone(a.target) if a.target.startswith(("http://", "https://", "git@")) else a.target
     if not Path(repo).is_dir():
         sys.exit(f"not a directory: {repo}")
+
+    if a.workspaces:
+        return _print_workspaces(repo, a)
 
     if a.plan_only:
         ev = collect(repo)
@@ -151,6 +159,55 @@ def main(argv=None) -> int:
     if a.emit:
         _emit(a.emit, out.plan, out.evidence_fp, out.attempts, out.ledger)
     return 0 if out.ok else 1
+
+
+def _print_workspaces(repo: str, a) -> int:
+    """The workspace graph, with every decision attributed."""
+    from . import workspaces as ws_mod
+    g = ws_mod.discover(repo)
+
+    deploy, rejected = g.deployable(), g.rejected()
+    print(f"\n\033[1mworkspace graph\033[0m  {len(g.workspaces)} workspace(s), "
+          f"languages: {', '.join(g.languages()) or '—'}")
+    for note in g.notes:
+        print(f"  \033[33m! {note}\033[0m")
+
+    print(f"\n\033[1mrunnable ({len(deploy)})\033[0m")
+    for w in deploy:
+        flag = f" \033[33m[{w.status}]\033[0m" if w.status != "ok" else ""
+        print(f"  \033[32m▸\033[0m {w.path}  ({w.role}, {w.language}"
+              f"/{w.build_system}){flag}")
+        for r in w.why():
+            print(f"      \033[2m· {r}\033[0m")
+        if w.depends_on:
+            print(f"      \033[2m· depends on {', '.join(w.depends_on)}\033[0m")
+
+    # Rejections are the interesting half: a component we declined to plan is
+    # a claim, and it has to be reviewable.
+    shown = [w for w in rejected if w.role != "library"] or rejected
+    print(f"\n\033[1mnot runnable ({len(rejected)})\033[0m"
+          + (f"  showing {min(len(shown), 12)}" if len(rejected) > 12 else ""))
+    by_role: dict[str, int] = {}
+    for w in rejected:
+        by_role[w.role] = by_role.get(w.role, 0) + 1
+    print("  " + ", ".join(f"{k}={v}" for k, v in sorted(by_role.items())))
+    for w in shown[:12]:
+        print(f"  \033[2m·\033[0m {w.path}  ({w.role}) — {w.rejected_because}")
+
+    if not deploy:
+        print("\n  \033[33mno runnable component found; this repository may be "
+              "a library, a framework, or a container for others\033[0m")
+
+    if a.emit:
+        import json as _json
+        d = Path(a.emit)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "workspaces.json").write_text(_json.dumps(
+            {"root": g.root, "truncated": g.truncated, "notes": g.notes,
+             "workspaces": [{**asdict(w), "reasons": w.why()} for w in g.workspaces]},
+            indent=2, default=str) + "\n")
+        print(f"\n▸ emitted workspaces.json -> {d}")
+    return 0
 
 
 def _print_lint(plan, ev) -> int:
