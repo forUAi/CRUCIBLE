@@ -116,8 +116,9 @@ def run_fixture(name: str, budget: int = 2, timeout: int = 900) -> dict:
           f"cp -r {HOST_REPO}/security/fixtures/{name} {GUEST_FIXTURES}/{name}",
           timeout=120)
     r = guest(
-        f"cd {GUEST_CRUCIBLE} && sudo python3 -m crucible.cli "
+        f"cd {GUEST_CRUCIBLE} && sudo python3 -u -m crucible.cli "
         f"{GUEST_FIXTURES}/{name} --no-llm --budget {budget} --no-cache "
+        f"--step-timeout 90 --verbose "
         f"2>&1 | tail -120", timeout=timeout)
     return {"stdout": r.stdout, "rc": r.returncode,
             "seconds": round(time.time() - started, 1)}
@@ -136,13 +137,27 @@ def evaluate(name: str, run: dict, before: dict, after: dict) -> dict:
             except (json.JSONDecodeError, ValueError):
                 pass
 
+    for line in log.splitlines():
+        for tag in ("PROBE_REPORT2", "RUNTIME_PROBE"):
+            if tag in line:
+                try:
+                    probes.update(json.loads(line.split(tag, 1)[1].strip()))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
     escaped = [k for k, v in probes.items()
                if isinstance(v, str) and (v.startswith("WROTE")
                                           or v.startswith("REACHED"))]
+    # Absence of evidence is not evidence of absence. A fixture whose probes
+    # never reported tells us nothing about containment, and reporting that
+    # as PASS is exactly the false green this harness exists to prevent: the
+    # first version did precisely that when pip swallowed the build output.
     return {
         "fixture": name,
         "seconds": run["seconds"],
-        "confined": not escaped,
+        "inconclusive": not probes,
+        "n_probes": len(probes),
+        "confined": bool(probes) and not escaped,
         "escaped_probes": escaped,
         "recorded": "egress ledger" in log or bool(probes),
         "host_clean": not host_findings,
@@ -177,11 +192,15 @@ def main() -> int:
         after = host_snapshot()
         res = evaluate(a.run, run, before, after)
         results.append(res)
-        verdict = all((res["confined"], res["recorded"],
-                       res["host_clean"], res["torn_down"]))
-        print(f"   confined={res['confined']} recorded={res['recorded']} "
-              f"host_clean={res['host_clean']} torn_down={res['torn_down']} "
-              f"({res['seconds']}s)  => {'PASS' if verdict else 'FAIL'}")
+        verdict = ("INCONCLUSIVE" if res["inconclusive"] else
+                   "PASS" if all((res["confined"], res["recorded"],
+                                  res["host_clean"], res["torn_down"]))
+                   else "FAIL")
+        print(f"   probes={res['n_probes']} confined={res['confined']} "
+              f"recorded={res['recorded']} host_clean={res['host_clean']} "
+              f"torn_down={res['torn_down']} ({res['seconds']}s)  => {verdict}")
+        for k, v in sorted(res["probes"].items()):
+            print(f"     · {k:24} {str(v)[:88]}")
         for k in ("escaped_probes", "host_findings", "residue"):
             for item in res[k]:
                 print(f"     ! {k}: {item}")
@@ -192,8 +211,9 @@ def main() -> int:
     if a.out:
         Path(a.out).write_text(json.dumps(
             {"results": results, "repeatable": stable}, indent=2) + "\n")
-    return 0 if (stable and all(r["confined"] and r["host_clean"]
-                                and r["torn_down"] for r in results)) else 1
+    return 0 if (stable and all(not r["inconclusive"] and r["confined"]
+                                and r["host_clean"] and r["torn_down"]
+                                for r in results)) else 1
 
 
 if __name__ == "__main__":

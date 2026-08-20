@@ -141,7 +141,8 @@ class Engine:
                  run_offline: bool = True, use_cache: bool = True,
                  base_override: Optional[str] = None,
                  store_mb: Optional[int] = None,
-                 step_timeout: Optional[int] = None):
+                 step_timeout: Optional[int] = None,
+                 verbose: bool = False):
         self.backend_cls = backend_cls
         self.budget = budget
         self.llm = llm
@@ -153,6 +154,7 @@ class Engine:
         from .backends.namespace import default_store_mb
         self.store_mb = store_mb or default_store_mb()
         self.step_timeout = step_timeout
+        self.verbose = verbose
 
     # ------------------------------------------------------------------
 
@@ -328,7 +330,13 @@ class Engine:
             self.log(f"  → {step.name}: \033[2m{step.cmd[:110]}\033[0m")
             if self.step_timeout:
                 step.timeout = min(step.timeout, self.step_timeout)
-            res = box.exec(step, plan.env, stream=None)
+            # A sandbox that discards the output of a *successful* build step
+            # has no record of what that step did -- and a build step is
+            # arbitrary code from an untrusted repository. On failure the tail
+            # is printed; on success it went nowhere.
+            sink = (lambda line, n=step.name: self.log(f"    \033[2m[{n}] {line}\033[0m")
+                    ) if self.verbose else None
+            res = box.exec(step, plan.env, stream=sink)
             if not res.ok:
                 self.log(f"    \033[31mfailed in {res.duration}s (exit {res.code})\033[0m")
                 return step, res

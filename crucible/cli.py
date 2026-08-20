@@ -67,6 +67,9 @@ def main(argv=None) -> int:
     ap.add_argument("target", help="path to a repo, or a git URL")
     ap.add_argument("--budget", type=int, default=6, help="max repair attempts")
     ap.add_argument("--mem", type=int, default=2048, help="memory cap (MB)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="stream every step's output; build steps are untrusted "
+                         "code and their output is the only record of what ran")
     ap.add_argument("--step-timeout", type=int, default=None,
                     help="cap every step's wall clock (seconds); the plan's own "
                          "timeouts still apply when lower")
@@ -121,7 +124,7 @@ def main(argv=None) -> int:
     eng = Engine(budget=a.budget, mem_mb=a.mem, run_offline=not a.online_run,
                  use_cache=not a.no_cache, llm=None if a.no_llm else _llm_from_env(),
                  base_override=a.base, store_mb=a.store_mb,
-                 step_timeout=a.step_timeout)
+                 step_timeout=a.step_timeout, verbose=a.verbose)
 
     out = eng.run(repo, prefer=a.prefer)
 
