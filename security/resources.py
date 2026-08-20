@@ -209,18 +209,51 @@ def case_timeout() -> dict:
     # 5s against a probe whose CPU case alone spins for 4s and whose thread
     # and memory cases add more. A timeout test whose step finishes in time
     # measures nothing, which is what "7.6s wall against a 20s limit" was.
-    out, _rc, secs = run_engine(["--step-timeout", "5", "--mem", "2048"], timeout=600)
+    limit = 5
+    out, _rc, secs = run_engine(["--step-timeout", str(limit), "--mem", "2048"],
+                                timeout=600)
     after = host_snapshot()
     ok, detail = cleanup_clean(before, after)
     timed = ("timed out" in out.lower() or "timeout" in out.lower()
              or "exit 124" in out.lower())
+
+    # THE CONTRACT. --step-timeout bounds the STEP, not the run: the engine
+    # still has to mount, pull, snapshot and tear down around it. Reporting
+    # "5s configured, 7.6s observed" conflated the two and looked like a
+    # breached limit when the step had in fact been killed 40 ms late.
+    #
+    # Permitted grace is the time between the deadline and the step actually
+    # dying: one second, which is process-group teardown plus scheduling, not
+    # a number chosen to fit the measurement.
+    step_secs = None
+    m = re.search(r"failed in ([\d.]+)s", out)
+    if m:
+        step_secs = float(m.group(1))
+    grace = round(step_secs - limit, 2) if step_secs is not None else None
+    GRACE_BOUND = 1.0
+
+    if not timed:
+        verdict, why = "INCONCLUSIVE", "no timeout was reported by the engine"
+    elif step_secs is None:
+        verdict, why = "MEASUREMENT_FAILED", (
+            "the step duration was not reported, so the grace cannot be bounded")
+    elif grace > GRACE_BOUND:
+        verdict, why = "UNENFORCED", (
+            f"the step ran {grace}s past its {limit}s deadline, beyond the "
+            f"{GRACE_BOUND}s permitted termination grace")
+    else:
+        verdict, why = "ENFORCED", (
+            f"step killed at {step_secs}s against a {limit}s deadline "
+            f"({grace}s grace, bound {GRACE_BOUND}s); the remaining "
+            f"{round(secs - step_secs, 1)}s of wall time is engine setup and "
+            f"teardown around the step, which the flag does not bound")
     return {
         "control": "step timeout",
-        "configured": "--step-timeout 5s",
+        "configured": f"--step-timeout {limit}s, permitted grace {GRACE_BOUND}s",
         "attempted": "a build step that takes longer",
-        "observed_peak": f"{secs}s wall",
-        "kernel_response": "SIGKILL to the process group by the supervisor",
-        "verdict": "ENFORCED" if timed and secs < 300 else "INCONCLUSIVE",
+        "observed_peak": f"step {step_secs}s (grace {grace}s), run {secs}s wall",
+        "kernel_response": why,
+        "verdict": verdict,
         "seconds": secs, "cleanup": detail, "cleanup_ok": ok,
     }
 
