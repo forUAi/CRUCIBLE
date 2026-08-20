@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -31,7 +33,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bench.corpus import CORPUS, Repo                      # noqa: E402
 from crucible.workspaces import discover                    # noqa: E402
 
-CACHE = Path("/tmp/crucible-bench")
+# Overridable so a release run can point at a persistent location rather than
+# re-cloning the corpus into /tmp on every invocation.
+CACHE = Path(os.environ.get("CRUCIBLE_CORPUS", "/tmp/crucible-bench"))
+
+
+def fetch_corpus(repos, log=print) -> int:
+    """Clone any pinned repository that is not present.
+
+    Blobless partial clones: the workspace graph is built from manifests and
+    directory structure, so full file contents are not needed and a corpus of
+    32 repositories would otherwise be several GB.
+    """
+    import subprocess
+    CACHE.mkdir(parents=True, exist_ok=True)
+    got = 0
+    for r in repos:
+        dest = CACHE / r.slug.split("/")[-1]
+        if (dest / ".git").is_dir():
+            got += 1
+            continue
+        shutil.rmtree(dest, ignore_errors=True)
+        p = subprocess.run(
+            ["git", "clone", "--quiet", "--depth", "1",
+             "--filter=blob:none", r.url, str(dest)],
+            capture_output=True, text=True, timeout=1800)
+        if p.returncode == 0 and (dest / ".git").is_dir():
+            got += 1
+        else:
+            log(f"  ! clone failed for {r.slug}: "
+                f"{(p.stderr or p.stdout).strip()[:120]}")
+    return got
 
 
 def local(r: Repo) -> Path:
@@ -96,6 +128,8 @@ def main() -> int:
     ap.add_argument("--split", default="dev")
     ap.add_argument("--unlock", action="store_true")
     ap.add_argument("--out")
+    ap.add_argument("--clone", action="store_true",
+                    help="fetch any pinned repository that is not present")
     a = ap.parse_args()
 
     splits = [s.strip() for s in a.split.split(",")]
@@ -114,6 +148,9 @@ def main() -> int:
               f"generalisation; use the sealed split at the next checkpoint.\n")
 
     repos = [r for r in CORPUS if r.split in splits]
+    if a.clone:
+        n = fetch_corpus(repos)
+        print(f"corpus: {n}/{len(repos)} repository(ies) present\n")
     rows = [score_one(r) for r in repos]
 
     print(f"{'repo':34}{'split':11}{'ws':>5}{'dep':>5}  checks  result")
@@ -152,7 +189,28 @@ def main() -> int:
 
     if a.out:
         Path(a.out).write_text(json.dumps(rows, indent=2) + "\n")
-    return 0
+
+    # A benchmark that measured nothing must not report success. On a machine
+    # without the pinned corpus every repository comes back `not_fetched`,
+    # and this exited 0 -- so a release gate recorded a PASS for a suite that
+    # scored 0/17. That is the same vacuous-pass failure this project rejects
+    # everywhere else.
+    missing = [r["slug"] for r in rows if r["outcome"] == "not_fetched"]
+    crashed = [r["slug"] for r in rows if r["outcome"] == "crash"]
+    if not scored:
+        print(f"\n  ! nothing was scored; {len(missing)} repository(ies) are "
+              f"not present. Fetch the corpus with `--clone` before treating "
+              f"this as a measurement.")
+        return 2
+    if missing:
+        print(f"\n  ! {len(missing)} repository(ies) not fetched and therefore "
+              f"not measured; this run covers {len(scored)}/{len(rows)}")
+        return 2
+    if crashed:
+        return 1
+    failed = [r for r in scored
+              if any(v is False for v in r["checks"].values())]
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
