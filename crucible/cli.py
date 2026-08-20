@@ -102,11 +102,8 @@ def main(argv=None) -> int:
         return 2 if (bad and a.lint_strict) else 0
 
     eng = Engine(budget=a.budget, mem_mb=a.mem, run_offline=not a.online_run,
-                 use_cache=not a.no_cache, llm=None if a.no_llm else _llm_from_env())
-    if a.base:
-        import crucible.planner as pl
-        _orig = pl.plan
-        pl.plan = lambda ev, prefer="auto": _rebase(_orig(ev, prefer), a.base)
+                 use_cache=not a.no_cache, llm=None if a.no_llm else _llm_from_env(),
+                 base_override=a.base)
 
     out = eng.run(repo, prefer=a.prefer)
 
@@ -138,12 +135,6 @@ def _print_lint(plan, ev) -> int:
     for f in findings:
         print(f"  \033[{'31' if f.severity == 'error' else '33'}m{f}\033[0m")
     return len(lint_mod.errors(findings))
-
-
-def _rebase(p, base):
-    p.base = base
-    p.note(f"base overridden by --base {base}")
-    return p
 
 
 def _emit(dirname: str, plan, efp: str, attempts, ledger=None) -> None:

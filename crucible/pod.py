@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .oci import image_config, pull_rootfs
+from .oci import cache_dir_for, image_config, pull_rootfs
 from .schema import Service
 
 STATE_ROOT = Path(os.environ.get("CRUCIBLE_STATE", "/var/lib/crucible"))
@@ -167,7 +167,7 @@ class Pod:
         port = svc.ports[0] if svc.ports else 0
         self.log(f"  ▸ sidecar {svc.name}  {svc.image}")
 
-        img_dir = STATE_ROOT / "images" / svc.image.replace("/", "_").replace(":", "_")
+        img_dir = cache_dir_for(STATE_ROOT, svc.image)
         pull_rootfs(svc.image, str(img_dir), log=lambda m: None)
         cfg = image_config(str(img_dir))
 

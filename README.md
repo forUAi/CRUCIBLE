@@ -41,7 +41,7 @@ step.** Get that, and a wrong guess costs the delta instead of the build.
    ├─▶ planner.py     Evidence ─▶ RunPlan. Author intent beats inference.
    ├─▶ engine.py      snapshot-hit? skip : exec, snapshot
    │                  boot sidecars ─▶ run ─▶ oracle ─▶ pass | diagnose ─▶ rewind
-   ├─▶ repair.py      29 deterministic rules; LLM only for what they can't name
+   ├─▶ repair.py      34 deterministic rules; LLM only for what they can't name
    ├─▶ oracle.py      archetype-specific success predicates
    ├─▶ pod.py         shared-netns sidecar services
    ├─▶ netlog.py      egress ledger (DNS + socket)
@@ -276,7 +276,7 @@ crucible/
   schema.py       Evidence / RunPlan / ExecResult
   evidence.py     deterministic fingerprinting
   planner.py      Evidence -> RunPlan, Dockerfile interpretation
-  repair.py       29 rules + LLM fallback
+  repair.py       34 rules + LLM fallback
   oracle.py       archetype-specific verification
   engine.py       the loop
   pod.py          shared-netns sidecar services

@@ -165,6 +165,10 @@ def _r_pymod(m, plan, step):
     alias = {"cv2": "opencv-python-headless", "PIL": "pillow", "yaml": "pyyaml",
              "sklearn": "scikit-learn", "bs4": "beautifulsoup4", "dotenv": "python-dotenv",
              "jwt": "pyjwt", "psycopg2": "psycopg2-binary", "OpenSSL": "pyopenssl",
+             # plain `psycopg` (v3) ships no libpq; the [binary] extra does.
+             # Installing the bare name "succeeds" and then fails at import
+             # with "no pq wrapper available", one layer further from the cause.
+             "psycopg": "psycopg[binary]",
              "attr": "attrs", "dateutil": "python-dateutil", "google": "protobuf"}
     pkg = alias.get(mod, mod)
     return Patch(f"python module `{mod}` missing -> pip install {pkg}", 0.9,
@@ -178,6 +182,23 @@ def _r_pymod(m, plan, step):
 def _r_pep668(m, plan, step):
     return Patch("PEP 668 externally-managed env -> allow system pip installs", 0.99,
                  lambda p: p.env.update({"PIP_BREAK_SYSTEM_PACKAGES": "1"}), tags=["python"])
+
+
+@rule(r"Cannot uninstall ['\"]?([\w.\-]+)['\"]?[^\n]*?"
+      r"(?:RECORD file not found|distutils installed project)")
+def _r_distro_owned(m, plan, step):
+    """A distro-packaged module in the way of a pip upgrade.
+
+    Debian/Ubuntu ship python modules through apt, which writes no RECORD, so
+    pip can see the package but cannot uninstall it and refuses to replace it.
+    Reachable only once PEP 668 has been cleared -- so it is the *second* wall
+    on the `--base host` path, and without it the loop diagnoses the first
+    wall correctly and then stalls on the next one.
+    """
+    return Patch(
+        f"`{m.group(1)}` is distro-owned and unremovable -> pip --ignore-installed",
+        0.95,
+        lambda p: p.env.update({"PIP_IGNORE_INSTALLED": "1"}), tags=["python"])
 
 
 @rule(r"(?:requires Python|Requires-Python)\s*[>=^~]{1,2}\s*(\d+\.\d+)")

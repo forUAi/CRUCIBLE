@@ -1,0 +1,32 @@
+# Lima VM for CRUCIBLE: the Linux substrate the sandbox requires.
+# Apple Virtualization.framework (vz) -> native arm64, no QEMU emulation.
+vmType: "vz"
+os: "Linux"
+arch: "aarch64"
+
+images:
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+
+cpus: 4
+memory: "6GiB"
+disk: "40GiB"
+
+mountType: "virtiofs"
+mounts:
+- location: "~/Projects/crucible"
+  writable: true
+
+# CRUCIBLE needs: overlayfs, mount/pid/net/uts/ipc namespaces, cgroup v2,
+# losetup + mkfs.ext4 for the private layer store, util-linux nsenter/unshare.
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq python3 python3-venv util-linux e2fsprogs mount \
+                          ca-certificates curl git iproute2 procps rsync >/dev/null
+    modprobe overlay || true
+    echo "cgroup version:"; stat -fc %T /sys/fs/cgroup

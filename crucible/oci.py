@@ -17,6 +17,7 @@ import gzip
 import io
 import json
 import os
+import platform
 import shutil
 import tarfile
 import urllib.request
@@ -30,6 +31,74 @@ ACCEPT = ",".join([
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
 ])
+
+# OCI platform strings are not uname strings, and the gap is silent: nothing
+# rejects "aarch64" as an architecture, it just never matches a manifest.
+_ARCH_MAP = {
+    "x86_64": ("amd64", ""),   "amd64": ("amd64", ""),
+    "aarch64": ("arm64", "v8"), "arm64": ("arm64", "v8"),
+    "armv7l": ("arm", "v7"),   "armv6l": ("arm", "v6"),
+    "ppc64le": ("ppc64le", ""), "s390x": ("s390x", ""),
+    "riscv64": ("riscv64", ""), "i386": ("386", ""), "i686": ("386", ""),
+}
+
+
+def host_arch() -> tuple[str, str]:
+    """(architecture, variant) for this machine, in OCI's vocabulary."""
+    return _ARCH_MAP.get(platform.machine().lower(), ("amd64", ""))
+
+
+def _resolve_arch(arch: str | None) -> tuple[str, str]:
+    """None => this host. CRUCIBLE_ARCH overrides, for deliberate cross-pulls."""
+    arch = arch or os.environ.get("CRUCIBLE_ARCH") or None
+    if arch is None:
+        return host_arch()
+    if arch in _ARCH_MAP:                       # tolerate a uname spelling
+        return _ARCH_MAP[arch]
+    a, _, v = arch.partition("/")               # tolerate "arm64/v8"
+    return a, v
+
+
+def cache_dir_for(root, ref: str, arch: str | None = None) -> Path:
+    """Where `ref` unpacks to. The architecture is part of the key: the same
+    tag is a different rootfs on a different machine, and a cache that ignores
+    that will hand an amd64 tree to an arm64 kernel and call it a hit."""
+    a, v = _resolve_arch(arch)
+    slug = ref.replace("/", "_").replace(":", "_")
+    return Path(root) / "images" / f"{slug}@linux-{a}{'-' + v if v else ''}"
+
+
+def _pick_manifest(index: dict, ref: str, arch: str, variant: str) -> str:
+    """Choose the digest for our platform out of a manifest list.
+
+    Refuses rather than guesses. The previous code fell back to
+    `manifests[0]`, which on an arm64 host quietly selected the amd64 image;
+    the pull and the extract both succeeded and the error surfaced much later
+    as `chroot: failed to run command '/bin/sh': Exec format error`, which
+    names neither the image nor the architecture.
+    """
+    def plat(m):
+        return m.get("platform") or {}
+
+    cands = [m for m in index.get("manifests", [])
+             if plat(m).get("os") == "linux"
+             and plat(m).get("architecture") == arch]
+    pick = (next((m for m in cands if (plat(m).get("variant") or "") == variant), None)
+            or next((m for m in cands if not plat(m).get("variant")), None)
+            or (cands[0] if cands else None))
+    if pick is None:
+        avail = sorted({
+            f"{plat(m).get('os')}/{plat(m).get('architecture')}"
+            + (f"/{plat(m)['variant']}" if plat(m).get("variant") else "")
+            for m in index.get("manifests", [])
+            if plat(m).get("architecture") not in (None, "unknown")
+        })
+        raise RuntimeError(
+            f"{ref} has no linux/{arch}{'/' + variant if variant else ''} manifest; "
+            f"published platforms: {', '.join(avail) or 'none'}. "
+            f"Set CRUCIBLE_ARCH to pull a different one deliberately."
+        )
+    return pick["digest"]
 
 
 def _split_ref(ref: str) -> tuple[str, str, str]:
@@ -59,12 +128,21 @@ def _token(registry: str, name: str) -> str | None:
     return json.loads(_get(url, accept="application/json"))["token"]
 
 
-def pull_rootfs(ref: str, dest: str, arch: str = "amd64", log=print) -> str:
-    """Download `ref` and extract its layers into `dest`. Idempotent."""
+def pull_rootfs(ref: str, dest: str, arch: str | None = None, log=print) -> str:
+    """Download `ref` and extract its layers into `dest`. Idempotent.
+
+    `arch` defaults to *this host*. It used to default to "amd64" and no
+    caller ever overrode it, so on an arm64 machine every pull succeeded and
+    every exec then failed. A cross-architecture pull is a thing you have to
+    ask for, not a thing you get by omission.
+    """
+    arch, variant = _resolve_arch(arch)
+    plat = f"linux/{arch}" + (f"/{variant}" if variant else "")
     dest_p = Path(dest)
     stamp = dest_p / ".crucible-image"
-    if stamp.exists() and stamp.read_text().strip() == ref:
-        log(f"  rootfs cached: {ref}")
+    want = f"{ref} {plat}"
+    if stamp.exists() and stamp.read_text().strip() == want:
+        log(f"  rootfs cached: {want}")
         return str(dest_p)
 
     registry, name, tag = _split_ref(ref)
@@ -73,15 +151,11 @@ def pull_rootfs(ref: str, dest: str, arch: str = "amd64", log=print) -> str:
 
     manifest = json.loads(_get(f"{base}/manifests/{tag}", tok))
 
-    # multi-arch index -> pick our platform
+    # multi-arch index -> pick our platform (or refuse; never guess)
     if "manifests" in manifest:
-        pick = next(
-            (m for m in manifest["manifests"]
-             if m.get("platform", {}).get("architecture") == arch
-             and m.get("platform", {}).get("os") == "linux"),
-            manifest["manifests"][0],
-        )
-        manifest = json.loads(_get(f"{base}/manifests/{pick['digest']}", tok))
+        log(f"  platform: {plat}")
+        digest = _pick_manifest(manifest, ref, arch, variant)
+        manifest = json.loads(_get(f"{base}/manifests/{digest}", tok))
 
     # The config blob carries Entrypoint/Cmd/Env -- i.e. how the image author
     # said to run it. Fetching it means sidecar commands come from the image
@@ -118,7 +192,7 @@ def pull_rootfs(ref: str, dest: str, arch: str = "amd64", log=print) -> str:
         with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
             _extract_with_whiteouts(tf, dest_p)
 
-    stamp.write_text(ref)
+    stamp.write_text(want)
     if cfg:
         (dest_p / ".crucible-config.json").write_text(json.dumps(cfg, indent=1))
     return str(dest_p)

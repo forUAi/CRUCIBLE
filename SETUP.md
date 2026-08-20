@@ -149,3 +149,160 @@ sidecars  none                       →  sidecar   postgres (from the JDBC url)
 
 All of this is the analysis half, so it is verified on macOS. The execution
 half is unchanged and still needs Linux.
+
+---
+
+# Session 2 — executing it
+
+The note above says "**Execution does not [work]**… you need a Linux host". That
+is true of Darwin and only of Darwin. It is a statement about the substrate, not
+about the code, and it is cheap to fix: `brew install lima` and an Ubuntu 24.04
+arm64 VM on Apple's Virtualization.framework. The VM config lives in
+`.lima/crucible.yaml`.
+
+```bash
+limactl start --tty=false --name=crucible .lima/crucible.yaml
+limactl shell crucible -- bash -lc '
+  rsync -a --exclude .venv --exclude __pycache__ ~/Projects/crucible/ ~/crucible/
+  cd ~/crucible && sudo python3 -m crucible.cli examples/py-fastapi'
+```
+
+Everything below was found by running it there. All seven are in the README's
+"bugs only running it could have found" genre; none is a typo.
+
+## 1. `oci.py` pulled the wrong architecture, then hid it
+
+`pull_rootfs(ref, dest, arch="amd64")` — and no caller ever passed `arch`. On
+this arm64 host the pull succeeded, the extract succeeded, and the first exec
+died with `chroot: failed to run command '/bin/sh': Exec format error`, which
+names neither the image nor the architecture.
+
+The multi-arch selector made it worse: when no manifest matched it fell back to
+`manifests[0]` rather than failing, converting "this image is not published for
+your platform" into a silent wrong answer.
+
+Fixed: `host_arch()` maps uname spellings to OCI ones, selection is
+variant-aware, a miss raises and lists the platforms that *are* published, and
+`cache_dir_for()` puts the architecture in the image cache key — a cache that
+ignores it will hand an amd64 tree to an arm64 kernel and call it a hit.
+`CRUCIBLE_ARCH` still allows a deliberate cross-pull.
+
+## 2. A failed `apt-get` was invisible to the repair loop
+
+`_install_system` threw its result away. Worse, `exec()` computes
+`ok = (code == 0 and not timed_out) or step.allow_fail`, so the flag that makes
+the step non-fatal also makes it *unreadable* — `res.ok` is True by
+construction. Checking `res.code` is the only way to see the truth.
+
+The visible symptom was a loop that diagnosed correctly and then gave up:
+
+```
+attempt 1  → [rule p=0.90] `pip` not on PATH -> apt python3-pip
+attempt 2  → ✗ unrepairable failure in `install/pip` -- no patch available
+```
+
+The rule was right. The remedy failed and said nothing, so the next attempt met
+the identical error, found no new rule, and blamed the repo. **A repair loop
+that cannot observe its own remedy fail will misattribute every time.**
+
+## 3. The sandbox had no resolver at all on `--base host`
+
+With the apt failure visible, the cause showed up immediately:
+`Temporary failure resolving 'ports.ubuntu.com'`.
+
+On a systemd host `/etc/resolv.conf` is a symlink into `/run` — and `/run` is a
+separate mount, so it is *not* part of an overlay whose lower is `/`. Inside the
+sandbox that symlink dangles. `Path.write_text()` follows it to a directory that
+does not exist, raises `OSError`, and lands in a bare `except OSError: pass`.
+
+Two silences stacked: the symlink deref failed, and the handler swallowed it.
+Fixed by unlinking whatever is there and writing a real file, and by logging the
+failure instead of passing.
+
+## 4. `--base` was silently revoked by the plan cache
+
+The CLI implemented `--base` by monkeypatching `planner.plan`. `_seed_plan`
+returns a cached plan *before* the planner is ever called, so on a cache hit the
+user's explicit override vanished — `--base host` ran on `python:3.12-slim` and
+nothing said why. Moved to `Engine.base_override`, applied to whichever plan was
+seeded. An override a cache can quietly revoke is worse than no override.
+
+## 5. New rule: distro-owned packages (34 rules, not 29)
+
+`Cannot uninstall typing_extensions … RECORD file not found` — apt-installed
+modules carry no RECORD, so pip can see them and refuses to replace them. This
+is the *second* wall on `--base host`, reachable only after PEP 668 is cleared,
+so the loop previously stalled one step past its own success. Sets
+`PIP_IGNORE_INSTALLED`, the same env-var mechanism the PEP 668 rule uses.
+
+The full chain now runs to green with no LLM:
+
+```
+attempt 1  install/pip  → [rule] `pip` not on PATH -> apt python3-pip
+attempt 2  install/pip  → [rule] PEP 668 externally-managed env
+attempt 3  install/pip  → [rule] `typing_extensions` distro-owned -> --ignore-installed
+attempt 4  ✓ port 8000 answered                                    [22.7s]
+```
+
+## 6. The layer cache could return the wrong filesystem
+
+The worst of the seven, because its failure mode is a *pass*.
+
+The chain key was `base + system_packages + step.key()`, and `Step.key()` is
+`sha256(cmd | cwd | env)`. `pip install --no-cache-dir -r requirements.txt`
+under `python:3.12-slim` is byte-identical in every python repo alive. Layers
+are shared across runs and across repos deliberately — that is the "shape
+transfer" feature — so the collision is the *normal* case, not an exotic one.
+
+Observed: a brand-new repo reported `⤳ install/pip (snapshot hit, skipped)` for
+a `requirements.txt` the system had never read, and ran against a different
+repo's site-packages. Here it surfaced as a confusing `ImportError`; had the
+first repo's dependencies been a superset of the second's it would have gone
+green and emitted a Dockerfile that never installs what the repo declares.
+
+The README already caught the neighbouring case — "`pip install -r
+requirements.txt` under `python:3.11` and under `node:22` are different layers
+that happen to share a command string". This is the same argument one step
+further in: the same command against a different manifest is a different layer
+too.
+
+`manifest_digest()` hashes every dependency manifest in the repo (28 filenames,
+depth 3, vendor dirs skipped) into the chain seed. Identical manifests still
+share layers — that is the feature — and source edits still do not bust the
+install layer. `tests/test_cache_key.py` pins all three properties.
+
+## 7. The emitted `compose.yml` could not connect
+
+The pod model is the reason `DATABASE_URL` says `127.0.0.1:5432`: app and
+sidecars share one network namespace. Compose gives every service its own and
+resolves peers by name. `to_compose` copied the verified env verbatim, so the
+generated file declared a postgres it could never reach — a bad failure for an
+artifact whose whole claim is that it was validated by execution.
+`compose_host_rewrite()` translates sidecar `host:port` to `service:port` and
+leaves the app's own port alone.
+
+## Footgun, documented rather than fixed
+
+`--emit` into the analyzed repo makes the *next* run read CRUCIBLE's own output
+as author intent — the planner prefers a declared Dockerfile, so a repair gets
+frozen in permanently and re-inference never happens again. Emit to a separate
+directory, or pass `--prefer infer`. This bit during this session and the run it
+produced was discarded.
+
+## Verified on this machine
+
+Ubuntu 24.04 aarch64, kernel 6.8, cgroup v2, Lima/vz on an M-series Mac.
+
+```
+✓ daemonless OCI pull          python:3.12-slim, postgres:16-alpine, redis:7-alpine (arm64)
+✓ pod netns + loopback up      net:[4026532420], egress cut, 127.0.0.1 live
+✓ postgres sidecar             real initdb, ready on 127.0.0.1:5432
+✓ redis sidecar                ready on 127.0.0.1:6379
+✓ two sidecars in one pod      both ready before the app starts
+✓ oracle                       port 8000 answered, network CUT
+✓ deterministic repair chain   3 rules -> green, no LLM
+✓ plan cache warm start        35.7s -> 10.1s
+✓ cross-run snapshot reuse     install/pip restored from disk
+✓ egress ledger                pypi.org + files.pythonhosted.org + peer IPs
+✓ 27 unit tests
+```

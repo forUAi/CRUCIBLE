@@ -147,8 +147,8 @@ class NamespaceBackend(SandboxBackend):
             self.base_dir = Path("/")
             self.log(f"  base: host rootfs (read-only lower)")
         else:
-            from ..oci import pull_rootfs
-            cache = STATE_ROOT / "images" / base.replace("/", "_").replace(":", "_")
+            from ..oci import cache_dir_for, pull_rootfs
+            cache = cache_dir_for(STATE_ROOT, base)
             self.log(f"  base: pulling {base}")
             pull_rootfs(base, str(cache), log=self.log)
             self.base_dir = cache
@@ -216,13 +216,28 @@ class NamespaceBackend(SandboxBackend):
         # looks up is recorded on the way through.
         try:
             (self.merged / "etc").mkdir(parents=True, exist_ok=True)
+            rc = self.merged / "etc/resolv.conf"
+            # Unlink first, and never write *through* whatever is already
+            # there. On a systemd host /etc/resolv.conf is a symlink into
+            # /run, and /run is a separate mount -- so it is NOT part of an
+            # overlay whose lower is `/`. Inside the sandbox that symlink
+            # dangles, write_text() follows it to a directory that does not
+            # exist, and the OSError below used to swallow the whole thing:
+            # the sandbox got no resolver at all, apt died with "Temporary
+            # failure resolving", and the repair loop blamed the repo.
+            if rc.is_symlink() or rc.exists():
+                rc.unlink(missing_ok=True)
             if self.dns is not None and self.dns.active:
-                (self.merged / "etc/resolv.conf").write_text(
-                    f"nameserver {self.dns.bind}\noptions timeout:3\n")
+                rc.write_text(f"nameserver {self.dns.bind}\noptions timeout:3\n")
             else:
-                shutil.copy("/etc/resolv.conf", self.merged / "etc/resolv.conf")
-        except OSError:
-            pass
+                # Resolve on the host side too: the source may itself be a
+                # symlink into a filesystem the sandbox cannot see.
+                src = Path("/etc/resolv.conf").resolve()
+                rc.write_text(src.read_text() if src.exists()
+                              else "nameserver 1.1.1.1\n")
+        except OSError as e:
+            self.log(f"  ! could not write /etc/resolv.conf ({e}) -- "
+                     f"name resolution will fail inside the sandbox")
 
         # Propagate the host CA trust store into the sandbox.
         #
@@ -484,12 +499,30 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         self._cg = []
 
     def _install_system(self, pkgs: list[str]) -> None:
+        """Install the base-image packages a repair asked for.
+
+        Non-fatal on purpose -- a partially satisfied install can still unblock
+        the step -- but no longer *silent*. The result used to be discarded, so
+        a failed `apt-get` was indistinguishable from a successful one: the
+        repair loop applied the right patch, watched the identical error come
+        back, found no new rule for it, and reported `unrepairable` for a
+        failure it had diagnosed correctly and merely failed to fix. A repair
+        loop that cannot see its own remedy fail will misattribute every time.
+        """
+        self.log(f"  system packages: {' '.join(pkgs)}")
         step = Step("system-packages",
                     "apt-get update -qq && apt-get install -y -qq --no-install-recommends "
                     + " ".join(pkgs),
                     network=True, timeout=900, allow_fail=True)
-        self.log(f"  system packages: {' '.join(pkgs)}")
-        self.exec(step, {})
+        res = self.exec(step, {})
+        # NOT `res.ok`: allow_fail forces that True by construction
+        # (`ok = (code == 0 and not timed_out) or step.allow_fail`). The exit
+        # code is the only thing here that still carries the truth.
+        if res.code != 0 or res.timed_out:
+            self.log(f"  ! system packages FAILED (exit {res.code}) -- the repair that "
+                     f"asked for `{' '.join(pkgs)}` did not take effect")
+            for line in res.tail(4).splitlines():
+                self.log(f"    {line}")
 
 
 def _q(v: str) -> str:

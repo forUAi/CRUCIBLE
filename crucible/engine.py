@@ -27,6 +27,7 @@ Three properties make this affordable, and all three are easy to get wrong:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -70,10 +71,74 @@ class Outcome:
     steps_skipped: int = 0
 
 
+_MANIFESTS = (
+    "requirements.txt", "requirements-dev.txt", "constraints.txt", "pyproject.toml",
+    "poetry.lock", "Pipfile", "Pipfile.lock", "setup.py", "setup.cfg",
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "go.mod", "go.sum", "Cargo.toml", "Cargo.lock",
+    "Gemfile", "Gemfile.lock", "composer.json", "composer.lock",
+    "pom.xml", "build.gradle", "build.gradle.kts", "gradle.lockfile",
+    "mix.exs", "mix.lock", "Dockerfile",
+)
+_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "target", "dist",
+              "build", "__pycache__", ".tox", "vendor"}
+
+
+def manifest_digest(repo, depth: int = 3) -> str:
+    """Content hash of every dependency manifest in the repo.
+
+    The layer chain was keyed on base + system packages + step *command*, and
+    a command string does not identify what the command reads. `pip install
+    -r requirements.txt` under `python:3.12-slim` is byte-identical in every
+    python repo alive, so two repos of the same shape produced the same chain
+    key and the second silently adopted the first's site-packages -- with the
+    wrong dependency set installed and nothing anywhere saying so. Because
+    layers are deliberately shared across runs and across repos, that
+    collision is the *normal* case, not an exotic one, and it can return a
+    green run whose emitted Dockerfile never installs what the repo declares.
+
+    The README already caught the neighbouring case -- "`pip install -r
+    requirements.txt` under python:3.11 and under node:22 are different
+    layers that happen to share a command string". This is the same argument
+    one step further in: the same command against a different manifest is a
+    different layer too.
+
+    Over-invalidating is the safe direction here. A missed cache hit costs
+    seconds; a false hit costs a wrong answer that looks right.
+    """
+    root = Path(repo)
+    h = hashlib.sha256()
+    found: list[tuple[str, bytes]] = []
+
+    def walk(d: Path, level: int) -> None:
+        if level > depth:
+            return
+        try:
+            entries = sorted(d.iterdir(), key=lambda e: e.name)
+        except OSError:
+            return
+        for e in entries:
+            if e.is_dir() and not e.is_symlink():
+                if e.name not in _SKIP_DIRS and not e.name.startswith("."):
+                    walk(e, level + 1)
+            elif e.name in _MANIFESTS:
+                try:
+                    found.append((str(e.relative_to(root)), e.read_bytes()))
+                except OSError:
+                    pass
+
+    walk(root, 0)
+    for rel, data in sorted(found):
+        h.update(rel.encode())
+        h.update(hashlib.sha256(data).digest())
+    return h.hexdigest()[:16]
+
+
 class Engine:
     def __init__(self, backend_cls=NamespaceBackend, budget: int = 6,
                  llm: Optional[Callable] = None, log=print, mem_mb: int = 2048,
-                 run_offline: bool = True, use_cache: bool = True):
+                 run_offline: bool = True, use_cache: bool = True,
+                 base_override: Optional[str] = None):
         self.backend_cls = backend_cls
         self.budget = budget
         self.llm = llm
@@ -81,6 +146,7 @@ class Engine:
         self.mem_mb = mem_mb
         self.run_offline = run_offline
         self.use_cache = use_cache
+        self.base_override = base_override
 
     # ------------------------------------------------------------------
 
@@ -220,9 +286,9 @@ class Engine:
     # ------------------------------------------------------------------
 
     def _run_steps(self, box, plan: RunPlan, out: Outcome):
-        import hashlib
         chain = hashlib.sha256(
-            (plan.base + "|" + ",".join(sorted(plan.system_packages))).encode()
+            (plan.base + "|" + ",".join(sorted(plan.system_packages))
+             + "|" + manifest_digest(box.repo)).encode()
         ).hexdigest()
         for step in plan.steps:
             chain = hashlib.sha256((chain + "|" + step.key()).encode()).hexdigest()
@@ -324,12 +390,28 @@ class Engine:
             if cached:
                 self.log(f"  \033[36mplan cache HIT for shape {efp} "
                          f"(gen {cached.generation}) -- warm start\033[0m")
-                return cached, True
+                return self._apply_base_override(cached), True
         p = planner_mod.plan(ev, prefer=prefer)
         self.log(f"\n\033[1m▸ plan\033[0m")
         for note in p.provenance:
             self.log(f"  \033[2m· {note}\033[0m")
-        return p, False
+        return self._apply_base_override(p), False
+
+    def _apply_base_override(self, p: RunPlan) -> RunPlan:
+        """`--base` is an instruction, not a suggestion, so it is applied to
+        whatever plan we seeded -- cached or freshly planned.
+
+        It used to be wired up by monkeypatching `planner.plan` from the CLI,
+        which meant a plan-cache hit (which returns before the planner is ever
+        called) silently discarded it: the user asked for `--base host`, the
+        run reported `base=python:3.12-slim`, and nothing said why. An
+        override that a cache can quietly revoke is worse than no override.
+        """
+        if self.base_override and p.base != self.base_override:
+            p.base = self.base_override
+            p.note(f"base overridden by --base {self.base_override}")
+            self.log(f"  \033[2m· base overridden by --base {self.base_override}\033[0m")
+        return p
 
     def _cache_get(self, efp: str) -> Optional[RunPlan]:
         try:
