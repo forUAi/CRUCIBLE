@@ -80,6 +80,12 @@ def main(argv=None) -> int:
                     help="layer store size in MB (default: half the free disk)")
     ap.add_argument("--base", default=None, help="override base image ('host' = host rootfs)")
     ap.add_argument("--prefer", choices=["auto", "declared", "infer"], default="auto")
+    ap.add_argument("--network", choices=["hermetic", "proxy", "open"],
+                    default="open",
+                    help="egress policy. hermetic: none at any phase. proxy: "
+                         "the operator's HTTP(S)_PROXY is passed to build "
+                         "steps. open: broad build connectivity, stated on "
+                         "every result")
     ap.add_argument("--online-run", action="store_true",
                     help="leave network up during run (default: cut it)")
     ap.add_argument("--no-cache", action="store_true")
@@ -131,7 +137,15 @@ def main(argv=None) -> int:
             _emit(a.emit, p, ev.fingerprint(), [], None)
         return 2 if (bad and a.lint_strict) else 0
 
-    eng = Engine(budget=a.budget, mem_mb=a.mem, run_offline=not a.online_run,
+    from . import netpolicy
+    try:
+        policy = netpolicy.resolve(a.network, runtime_online=a.online_run)
+    except netpolicy.PolicyError as e:
+        sys.exit(f"network policy: {e}")
+    print(f"\n\033[1m▸ network policy\033[0m  {policy.describe()}")
+
+    eng = Engine(policy=policy, budget=a.budget, mem_mb=a.mem,
+                 run_offline=not a.online_run,
                  use_cache=not a.no_cache, llm=None if a.no_llm else _llm_from_env(),
                  base_override=a.base, store_mb=a.store_mb,
                  step_timeout=a.step_timeout, verbose=a.verbose,
@@ -147,6 +161,9 @@ def main(argv=None) -> int:
     print(f"\033[1m{state}\033[0m  "
           f"{out.detail}   [{out.elapsed}s, {len(out.attempts)} attempt(s), "
           f"{out.steps_skipped} step(s) from cache]")
+    # Every result states the policy it ran under. A result that does not say
+    # cannot be compared with one that does.
+    print(f"  network policy: {policy.describe()}")
     for at in out.attempts:
         mark = "✓" if not at.diagnosis else "⟳"
         print(f"  {mark} attempt {at.n} ({at.duration}s) "
@@ -157,7 +174,7 @@ def main(argv=None) -> int:
         for line in out.ledger.report():
             print(f"  {line}")
     if a.emit:
-        _emit(a.emit, out.plan, out.evidence_fp, out.attempts, out.ledger)
+        _emit(a.emit, out.plan, out.evidence_fp, out.attempts, out.ledger, policy)
     return 0 if out.ok else 1
 
 
@@ -222,12 +239,14 @@ def _print_lint(plan, ev) -> int:
     return len(lint_mod.errors(findings))
 
 
-def _emit(dirname: str, plan, efp: str, attempts, ledger=None) -> None:
+def _emit(dirname: str, plan, efp: str, attempts, ledger=None,
+          policy=None) -> None:
     d = Path(dirname)
     d.mkdir(parents=True, exist_ok=True)
     (d / "Dockerfile").write_text(materialize.to_dockerfile(plan))
     (d / "crucible.lock.json").write_text(
-        materialize.to_lock(plan, efp, attempts, ledger))
+        materialize.to_lock(plan, efp, attempts, ledger,
+                            network_policy=policy.as_dict() if policy else None))
     if plan.services:
         (d / "compose.yml").write_text(materialize.to_compose(plan))
     print(f"\n▸ emitted: {', '.join(sorted(p.name for p in d.iterdir()))}  -> {d}")

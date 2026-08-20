@@ -41,6 +41,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+from dataclasses import replace
 from typing import Optional
 
 from ..schema import ExecResult, Step
@@ -176,6 +177,9 @@ class NamespaceBackend(SandboxBackend):
         self.image_env: dict[str, str] = {}  # ENV declared by the base image
         self.drain_grace = 2.0              # seconds to keep reading after exit
         self.stage_host_backed = True       # copy off host-shared storage first
+        from ..netpolicy import DEFAULT
+        self.policy = DEFAULT               # replaced by the engine
+        self._denied: dict = {}             # steps whose request we refused
         self.staged_from: Optional[str] = None
         self._mounted = False
         self._cg: list[Path] = []
@@ -432,7 +436,7 @@ class NamespaceBackend(SandboxBackend):
             "DEBIAN_FRONTEND": "noninteractive", "PYTHONUNBUFFERED": "1",
             "CI": "1", "NO_COLOR": "1",
             **self.image_env,           # the base image speaks for itself
-            **self._ca_env(), **env, **step.env,
+            **self._ca_env(), **self.policy.env_for("build"), **env, **step.env,
         }
         exports = "\n".join(
             f"export {k}={_q(v)}" for k, v in merged_env.items()
@@ -624,6 +628,18 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
           network=False       fresh empty netns via unshare --net
         """
         ns = ["unshare", "--mount", "--uts", "--ipc", "--pid", "--fork", "--kill-child"]
+        # THE enforcement point. A repair rule can set Step.network freely --
+        # _r_dns sets it on every step in the plan -- and under a restrictive
+        # policy the answer is simply no route. Asking every caller to be
+        # careful makes a policy advisory; refusing at the one place that
+        # creates the namespace makes it a property.
+        phase = "runtime" if step.name == "run" else "build"
+        if step.network and not self.policy.allows(phase):
+            if not self._denied.get(step.name):
+                self._denied[step.name] = True
+                self.log(f"  \033[33m! step `{step.name}` asked for network; "
+                         f"policy {self.policy.name} denies {phase} egress\033[0m")
+            step = replace(step, network=False)
         if step.network:
             return ns
         if self.pod is not None and self.pod.pid:

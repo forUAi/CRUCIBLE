@@ -119,7 +119,8 @@ def to_compose(plan: RunPlan, name: str = "app") -> str:
     return "\n".join(L) + "\n"
 
 
-def to_lock(plan: RunPlan, evidence_fp: str, attempts: list, ledger=None) -> str:
+def to_lock(plan: RunPlan, evidence_fp: str, attempts: list, ledger=None,
+            network_policy: dict | None = None) -> str:
     return json.dumps({
         "egress": ({"build_hostnames": ledger.hostnames,
                     "build_peers": [f"{i}:{p}" for i, p in ledger.peers],
@@ -128,6 +129,7 @@ def to_lock(plan: RunPlan, evidence_fp: str, attempts: list, ledger=None) -> str
                    if ledger is not None else None),
         "version": 1,
         "status": plan.status,
+        "network_policy": network_policy,
         "evidence_shape": evidence_fp,
         "plan_fingerprint": plan.fingerprint(),
         "repairs_applied": plan.generation,
