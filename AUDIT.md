@@ -103,8 +103,42 @@ mounts; store sizing. 59 tests, all passing on macOS and in the guest.
 
 ### Adversarially tested
 
-One fixture (`security/fixtures/hostile-python`), which found defects #10 and
-#11. Harness in `security/contain.py`. **Not yet a suite** — see §5.
+One fixture, `security/fixtures/hostile-python`, 11 probes, run 3× from a
+fresh layer store: **3/3 PASS, deterministic (12.4 / 12.3 / 12.4s), host
+clean, no residue.**
+
+```
+python3 security/contain.py --run hostile-python --repeat 3
+```
+
+| Probe | Result | Reading |
+|---|---|---|
+| `host_mount_visible` | `none` | no host path reachable from an OCI base |
+| `host_mount_write` | `no host mount reachable` | host canary never appeared |
+| `escape_workspace_write` | `WROTE /etc/…`, `WROTE /root/…` | **confined**, not escaped — those are the overlay upper and die with the box |
+| `symlink_traversal` | `WROTE via symlink into /etc` | same: inside the box |
+| `pid_namespace` | `pid=3 visible_pids=2` | pid isolation holds |
+| `cloud_metadata` | `ConnectionRefusedError` | refused here; **would reach on a cloud host** — not blocked by policy |
+| `outbound_hardcoded_ip` | `REACHED 1.1.1.1:443 without DNS` | **known policy gap**: build egress is recorded, not restricted |
+| `runtime_egress` | blocked | the pod netns has no route out |
+| `fork_pressure` | `400 processes, no cap hit` | **inconclusive** — the probe stops below the 512 pid cap |
+| `disk_pressure` | `wrote 1024 MiB inside the box` | **no per-box disk quota** |
+| `credentials` | `env: [GPG_KEY], paths: []` | no SSH/AWS/docker socket; `GPG_KEY` comes from the python image's own ENV, not the host |
+
+The harness reports `known_policy_gap` separately from `escaped` rather than
+folding either into the verdict. Build-phase egress is unrestricted **by
+design today** — calling that a pass would hide it, calling it an escape
+would make every run red and stop meaning anything.
+
+Two harness bugs worth recording, because both produced false greens:
+
+- It first reported **PASS on a run that captured zero probes** — absence of
+  evidence read as evidence of absence. A fixture whose probes never report
+  is now `INCONCLUSIVE` and exits non-zero.
+- Repetition 2 came back with zero probes because it hit the **layer cache
+  and skipped the probe step entirely**. Repeatability is meaningless when
+  run N is a cache hit on run N−1; the harness now wipes the layer store
+  before every repetition.
 
 ### Externally benchmarked
 
