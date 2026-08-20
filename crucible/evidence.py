@@ -251,6 +251,9 @@ def collect(root: str) -> Evidence:
     _parse_go(rootp, ev)
     _parse_cargo(rootp, ev)
     _parse_jvm(rootp, ev)
+    _parse_ruby(rootp, ev)
+    _parse_php(rootp, ev)
+    _parse_elixir(rootp, ev)
 
     # ---- 6. content grep: services, native deps, ports, frameworks ------
     grep_budget = 900
@@ -331,8 +334,14 @@ def _parse_package_json(root: Path, ev: Evidence) -> None:
             data = json.loads(_read(root / rel))
         except (json.JSONDecodeError, ValueError):
             continue
-        for k, v in (data.get("scripts") or {}).items():
-            ev.scripts[k] = f"npm run {k}"
+        if nm := data.get("name"):
+            _add_identity(ev, nm, rel)
+        # Only the root package's scripts are runnable as `npm run X` from the
+        # repo root. Merging a nested package's scripts made @nestjs/core look
+        # like it had a start script when the sample project did.
+        if "/" not in rel:
+            for k, v in (data.get("scripts") or {}).items():
+                ev.scripts[k] = f"npm run {k}"
         deps = {**(data.get("dependencies") or {}), **(data.get("devDependencies") or {})}
         for d in deps:
             base = d.split("/")[-1].replace("@", "")
@@ -353,12 +362,75 @@ def _parse_package_json(root: Path, ev: Evidence) -> None:
             ev.signals.append(Signal("trait", "esm", 0.9, rel))
 
 
+PY_FRAMEWORKS = ("django", "flask", "fastapi", "streamlit", "gradio",
+                 "celery", "uvicorn", "gunicorn")
+
+
+def _req_name(spec: str) -> str:
+    """`Flask>=3.0,<4 ; python_version>'3.9'` -> `flask`."""
+    return re.split(r"[<>=!~\[;\s(]", spec.strip(), maxsplit=1)[0].strip().lower()
+
+
+def _pyproject_deps(txt: str) -> tuple[list[str], str | None]:
+    """Read declared dependencies out of a pyproject, structurally.
+
+    A regex over this file cannot work. pallets/flask's own pyproject contains
+    `name = "Flask"`, `"Framework :: Flask"`, a console script
+    `flask = "flask.cli:main"` and `source = ["flask", "tests"]` -- four
+    self-references and not one dependency. Reading the actual dependency
+    tables is the difference between "mentions flask" and "depends on flask".
+    """
+    try:
+        import tomllib
+    except ImportError:                       # pragma: no cover -- py<3.11
+        return [], None
+    try:
+        data = tomllib.loads(txt)
+    except Exception:
+        return [], None
+
+    out: list[str] = []
+    proj = data.get("project") or {}
+    out += [d for d in (proj.get("dependencies") or []) if isinstance(d, str)]
+    for group in (proj.get("optional-dependencies") or {}).values():
+        out += [d for d in group if isinstance(d, str)]
+    for group in (data.get("dependency-groups") or {}).values():   # PEP 735
+        out += [d for d in group if isinstance(d, str)]
+    poetry = ((data.get("tool") or {}).get("poetry") or {})
+    out += list((poetry.get("dependencies") or {}).keys())
+    for group in (poetry.get("group") or {}).values():
+        out += list((group.get("dependencies") or {}).keys())
+    return out, (proj.get("name") or poetry.get("name"))
+
+
 def _parse_python(root: Path, ev: Evidence) -> None:
-    for rel in [f for f in ev.files if f.endswith(("requirements.txt", "pyproject.toml", "setup.py"))]:
+    for rel in [f for f in ev.files
+                if f.endswith(("requirements.txt", "pyproject.toml", "setup.py"))]:
         txt = _read(root / rel, 200_000)
-        for fw in ("django", "flask", "fastapi", "streamlit", "gradio", "celery", "uvicorn", "gunicorn"):
-            if re.search(rf"^\s*['\"]?{fw}\b", txt, re.M | re.I) or f'"{fw}' in txt.lower():
+        deps: list[str] = []
+        name: str | None = None
+
+        if rel.endswith("pyproject.toml"):
+            raw, name = _pyproject_deps(txt)
+            deps = [_req_name(d) for d in raw]
+        elif rel.endswith("requirements.txt"):
+            for line in txt.splitlines():
+                line = line.split("#", 1)[0].strip()
+                if line and not line.startswith("-"):
+                    deps.append(_req_name(line))
+        else:                                   # setup.py
+            if m := re.search(r"install_requires\s*=\s*\[([^\]]*)\]", txt, re.S):
+                deps = [_req_name(x) for x in re.findall(r"['\"]([^'\"]+)['\"]",
+                                                        m.group(1))]
+            if m := re.search(r"""name\s*=\s*['\"]([\w.\-]+)['\"]""", txt):
+                name = m.group(1)
+
+        seen = set(deps)
+        for fw in PY_FRAMEWORKS:
+            if fw in seen:
                 ev.signals.append(Signal("framework", fw, 0.95, rel))
+        if name:
+            _add_identity(ev, name, rel)
         if m := re.search(r'requires-python\s*=\s*["\'][^\d]*(\d+\.\d+)', txt):
             ev.signals.append(Signal("runtime", f"python:{m.group(1)}", 0.9, rel))
         if "[tool.poetry]" in txt:
@@ -371,10 +443,16 @@ def _parse_go(root: Path, ev: Evidence) -> None:
     if "go.mod" not in ev.files:
         return
     txt = _read(root / "go.mod", 100_000)
+    if m := re.search(r"^module\s+(\S+)", txt, re.M):
+        _add_identity(ev, m.group(1).replace(".", "/"), "go.mod")
     if m := re.search(r"^go\s+(\d+\.\d+)", txt, re.M):
         ev.signals.append(Signal("runtime", f"go:{m.group(1)}", 0.99, "go.mod"))
+    # Skip the `module` line: it names this repo, not a dependency. Scanning
+    # it made github.com/gin-gonic/gin look like an app built on gin.
+    deps = "\n".join(l for l in txt.splitlines()
+                     if not l.strip().startswith("module "))
     for fw in ("gin-gonic", "fiber", "echo", "chi"):
-        if fw in txt:
+        if fw in deps:
             ev.signals.append(Signal("framework", fw, 0.9, "go.mod"))
 
 
@@ -382,11 +460,110 @@ def _parse_cargo(root: Path, ev: Evidence) -> None:
     if "Cargo.toml" not in ev.files:
         return
     txt = _read(root / "Cargo.toml", 100_000)
+    if m := re.search(r'''^\s*name\s*=\s*["']([\w.\-]+)["']''', txt, re.M):
+        _add_identity(ev, m.group(1), "Cargo.toml")
     if "[workspace]" in txt:
         ev.workspaces.append("<cargo workspace>")
+        # A workspace root has no [package]; its members carry the identity.
+        if mm := re.search(r"members\s*=\s*\[([^\]]*)\]", txt, re.S):
+            for member in re.findall(r'''["']([\w.\-]+)\*?["']''', mm.group(1)):
+                if not member.endswith("-"):
+                    _add_identity(ev, member, "Cargo.toml")
     for fw in ("axum", "actix-web", "rocket", "warp", "tokio"):
         if re.search(rf"^{re.escape(fw)}\s*=", txt, re.M):
             ev.signals.append(Signal("framework", fw, 0.9, "Cargo.toml"))
+
+
+# ---------------------------------------------------------------------------
+# Project identity
+#
+# "This repo depends on Flask" and "this repo IS Flask" produce the same
+# corpus grep and mean opposite things. Recording what the project calls
+# itself lets the planner tell them apart -- without it, every framework's own
+# repository plans as an app built on itself.
+# ---------------------------------------------------------------------------
+
+def _identity_tokens(name: str) -> set[str]:
+    """Names a project might be known by, from one manifest name field."""
+    out: set[str] = set()
+    for tok in re.split(r"[/@:]", name.strip().lower()):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.add(tok)
+        # `@nestjs/core` is the nest framework; `fastify` is not `fastifyjs`.
+        if tok.endswith("js") and len(tok) > 4:
+            out.add(tok[:-2])
+    return out
+
+
+def _add_identity(ev: Evidence, name: str, rel: str) -> None:
+    for tok in _identity_tokens(name):
+        ev.signals.append(Signal("project.name", tok, 0.95, rel))
+
+
+# ---------------------------------------------------------------------------
+# Ruby / PHP / Elixir
+#
+# These three had no structured parser, so their frameworks were only ever
+# found by grepping a merged corpus -- which loses the one thing that makes a
+# signal trustworthy, the file it came from. A dependency declared in a
+# Gemfile and the word "rails" in a comment were indistinguishable.
+# ---------------------------------------------------------------------------
+
+def _parse_ruby(root: Path, ev: Evidence) -> None:
+    if "Gemfile" not in ev.files and not any(f.endswith(".gemspec") for f in ev.files):
+        return
+    add = ev.signals.append
+    if "Gemfile" in ev.files:
+        txt = _read(root / "Gemfile", 100_000)
+        for fw in ("rails", "sinatra", "hanami", "roda"):
+            if re.search(rf"^\s*gem\s+['\"]{fw}['\"]", txt, re.M):
+                add(Signal("framework", fw, 0.95, "Gemfile"))
+        if m := re.search(r"^\s*ruby\s+['\"]([\d.]+)['\"]", txt, re.M):
+            add(Signal("runtime", f"ruby:{m.group(1)}", 0.97, "Gemfile"))
+    for rel in [f for f in ev.files if f.endswith(".gemspec") and f.count("/") == 0]:
+        if m := re.search(r"""\.name\s*=\s*['"]([\w.\-]+)['"]""",
+                          _read(root / rel, 40_000)):
+            _add_identity(ev, m.group(1), rel)
+
+
+def _parse_php(root: Path, ev: Evidence) -> None:
+    if "composer.json" not in ev.files:
+        return
+    try:
+        data = json.loads(_read(root / "composer.json", 200_000))
+    except (json.JSONDecodeError, ValueError):
+        return
+    add = ev.signals.append
+    if nm := data.get("name"):
+        _add_identity(ev, nm, "composer.json")
+    req = {**(data.get("require") or {}), **(data.get("require-dev") or {})}
+    for dep in req:
+        low = dep.lower()
+        if low.startswith("laravel/"):
+            add(Signal("framework", "laravel", 0.95, "composer.json"))
+        if low.startswith("symfony/"):
+            add(Signal("framework", "symfony", 0.9, "composer.json"))
+        if low.startswith("slim/"):
+            add(Signal("framework", "slim", 0.9, "composer.json"))
+    if v := req.get("php"):
+        if m := re.search(r"(\d+\.\d+)", str(v)):
+            add(Signal("runtime", f"php:{m.group(1)}", 0.9, "composer.json"))
+
+
+def _parse_elixir(root: Path, ev: Evidence) -> None:
+    if "mix.exs" not in ev.files:
+        return
+    txt = _read(root / "mix.exs", 100_000)
+    add = ev.signals.append
+    for fw in ("phoenix", "plug_cowboy", "nerves"):
+        if re.search(rf"\{{:{fw},", txt):
+            add(Signal("framework", "phoenix" if fw == "phoenix" else fw, 0.95, "mix.exs"))
+    if m := re.search(r"app:\s*:(\w+)", txt):
+        _add_identity(ev, m.group(1), "mix.exs")
+    if m := re.search(r"elixir:\s*['\"][^\d]*([\d.]+)", txt):
+        add(Signal("runtime", f"elixir:{m.group(1)}", 0.95, "mix.exs"))
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +684,8 @@ def _parse_jvm(root: Path, ev: Evidence) -> None:
                 el = kids.get(key)
                 if el is not None and el.text:
                     add(Signal(kind, el.text.strip(), 0.99, rel))
+                    if kind == "jvm.artifact":
+                        _add_identity(ev, el.text.strip(), rel)
 
             build = kids.get("build")
             if build is not None:

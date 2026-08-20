@@ -103,6 +103,8 @@ def plan(ev: Evidence, prefer: str = "auto") -> RunPlan:
         if "devcontainer" in ev.declared:
             p = _from_devcontainer(ev)
             if p:
+                if not p.run:
+                    _adopt_run_from_inference(p, ev)
                 _merge_services(p, ev)
                 return _finish(p)
     p = _infer(ev)
@@ -110,6 +112,23 @@ def plan(ev: Evidence, prefer: str = "auto") -> RunPlan:
         _apply_procfile(p, ev)
     _merge_services(p, ev)
     return _finish(p)
+
+
+def _adopt_run_from_inference(p: RunPlan, ev: Evidence) -> None:
+    """A devcontainer describes a place to develop, not a service to run.
+
+    It never carries a start command -- there is no field for one -- so the
+    plan it produced had `run=""` and an archetype taken from `forwardPorts`.
+    Any repo with a devcontainer and a postCreateCommand therefore planned as
+    a web app with nothing to launch. Its base, env and setup steps are still
+    the author speaking; only the run has to come from inference.
+    """
+    guess = _infer(ev)
+    p.run = guess.run
+    p.archetype = guess.archetype
+    p.ports = guess.ports
+    p.oracle = _oracle_for(p.archetype, p.ports)
+    p.note("devcontainer states no run command; archetype and run inferred")
 
 
 def _finish(p: RunPlan) -> RunPlan:
@@ -362,7 +381,7 @@ def _pick_run(ev: Evidence, lang: str, pm: str | None, fw: str | None) -> tuple[
     entry = ev.entrypoints[0]["path"] if ev.entrypoints else ""
     aports = _app_ports(ev)
 
-    if fw and fw in FRAMEWORKS:
+    if fw and fw in FRAMEWORKS and _framework_implies_app(ev, fw, lang):
         arch, port, hint = FRAMEWORKS[fw]
         port = _declared_port(ev, port)
         if fw == "django":
@@ -384,6 +403,13 @@ def _pick_run(ev: Evidence, lang: str, pm: str | None, fw: str | None) -> tuple[
         # the ecosystem; only if that fails do we fall through to heuristics.
         if cmd := _synth_start(ev, lang, pm, fw, port):
             return arch, port, cmd
+
+    # A framework's own source tree, with no start script, is a library. The
+    # fall-through would otherwise pick `node index.js` off the package entry
+    # and call express a cli, or serve pallets/flask as a web app.
+    if (own := _framework_source(ev)) and not any(
+            s in ev.scripts for s in ("start", "dev", "serve")):
+        return "library", 0, _test_cmd(lang, pm)
 
     if lang == "node":
         for cand in ("start", "dev", "serve"):
@@ -419,6 +445,74 @@ def _test_cmd(lang: str, pm: str | None) -> str:
         "ruby": "bundle exec rspec || rake test", "java": "mvn -B test",
         "elixir": "mix test", "php": "vendor/bin/phpunit",
     }.get(lang, "make test")
+
+
+def _is_own_source(ev: Evidence, fw: str) -> bool:
+    """Is this repo the framework's own source tree?
+
+    The repo calls itself by the framework's name *and* no root manifest
+    declares that framework as a dependency. Both halves are needed:
+    laravel/laravel is also called laravel, but it requires laravel/framework
+    at the root, which is exactly what makes it an app. pallets/flask calls
+    itself Flask and only depends on flask under examples/.
+    """
+    names = {v for v, _ in ev.tally("project.name")}
+    if not names:
+        return False
+    base = fw.split("-")[0]
+    aliases = {fw} | ({base} if len(base) >= 4 else set())
+    if not (aliases & names):
+        return False
+    root_decl = [s for s in ev.why("framework", fw)
+                 if s != "<source scan>" and "/" not in s]
+    return not root_decl
+
+
+def _framework_source(ev: Evidence) -> str | None:
+    """The framework whose source tree this repo is, if any."""
+    for fw in FRAMEWORKS:
+        if _is_own_source(ev, fw):
+            return fw
+    return None
+
+
+def _framework_implies_app(ev: Evidence, fw: str, lang: str) -> bool:
+    """Does this framework signal mean the repo *runs* the framework?
+
+    Detecting `express` says nothing on its own. The express repository is
+    express; the rich repository mentions Django in a doc; a Cargo workspace
+    named axum is the axum crate. Letting any of those set archetype=web
+    produces a plan to serve HTTP from a library -- the mirror image of the
+    bug this guard sits next to, and one a benchmark against real repos found
+    immediately once the archetype stopped being discarded.
+
+    Four ways a framework name can appear without an app behind it.
+    """
+    # 1. Provenance. Evidence records the file behind every signal; a name
+    #    that only ever showed up in the merged corpus grep is a mention.
+    srcs = ev.why("framework", fw)
+    if srcs and all(s == "<source scan>" for s in srcs):
+        return False
+
+    # 2. Identity. The repo is the framework, not a user of it.
+    if _is_own_source(ev, fw):
+        return False
+
+    # 3. Compiled languages state it structurally: no main, no app. This is
+    #    the rule the existing go/rust branches already applied further down.
+    if lang == "go" and not any(f.endswith("main.go") for f in ev.files):
+        return False
+    if lang == "rust" and not any(
+            f in ("src/main.rs", "main.rs") or f.startswith("src/bin/")
+            for f in ev.files):
+        return False
+
+    # 4. A workspace root with nothing to start is a monorepo, not a service.
+    #    Its members may well be web apps; the root is not one.
+    if ev.workspaces and not any(s in ev.scripts for s in ("start", "dev", "serve")):
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------

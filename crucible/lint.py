@@ -35,7 +35,7 @@ import re
 from dataclasses import dataclass
 
 from .evidence import FRAMEWORKS
-from .planner import SERVICE_PORTS
+from .planner import SERVICE_PORTS, _framework_implies_app
 from .schema import Evidence, RunPlan
 
 # Commands that prove a repo's tests pass, not that its app runs. If the
@@ -91,8 +91,15 @@ def errors(findings: list[Finding]) -> list[Finding]:
 def _web_frameworks(ev: Evidence | None) -> list[str]:
     if ev is None:
         return []
+    # Share the planner's predicate exactly. A linter that asks a different
+    # question than the planner answers reports a contradiction every time the
+    # planner correctly declines a framework -- express's own repo is not a
+    # web app, and saying so is not an inconsistency.
+    lang = ev.top("language") or ""
     return [v for v, w in ev.tally("framework")
-            if w >= 0.6 and FRAMEWORKS.get(v, ("", 0, ""))[0] == "web"]
+            if w >= 0.6
+            and FRAMEWORKS.get(v, ("", 0, ""))[0] == "web"
+            and _framework_implies_app(ev, v, lang)]
 
 
 def _c_archetype_lost(plan, ev):

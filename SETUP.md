@@ -152,6 +152,84 @@ half is unchanged and still needs Linux.
 
 ---
 
+# Benchmark: 18 real repositories
+
+`examples/` only proves the planner does what I think it does on repos I wrote.
+`bench/bench.py` runs the same analysis against upstream code nobody shaped for
+it — Spring Petclinic, Flask, Express, gin, axum, ripgrep, Laravel, Nest,
+Rich, Requests, and Docker's sample apps.
+
+```bash
+python3 bench/bench.py --clone
+python3 bench/bench.py --run --out /tmp/after.json
+git worktree add /tmp/pre <pre-fix-sha>
+CRUCIBLE_ROOT=/tmp/pre python3 bench/bench.py --run --out /tmp/before.json
+python3 bench/bench.py --compare /tmp/before.json /tmp/after.json
+```
+
+| | before | after |
+|---|---|---|
+| archetype correct (unambiguous labels) | 5/12 | **11/12** |
+| plans that contradict their own evidence | 8/18 | **0/18** |
+| language correct | 14/16 | 14/16 |
+| crashes | 0 | 0 |
+
+`better 10, worse 0, unchanged 8`. The lint column is the one to trust: it
+needs no ground truth, because "this plan cannot verify what it claims to
+verify" is true or false regardless of what anyone thinks the repo is.
+
+## What the benchmark found that I did not
+
+Fixing the archetype fall-through created the mirror-image bug, and only real
+repos exposed it. `express`, `gin`, `axum` and `rich` started planning as web
+apps — a framework's own repository detects its own framework. Four
+independent causes, each needing its own rule:
+
+- **Provenance.** Evidence records the file behind every signal, and a name
+  that only ever appeared in the merged corpus grep is a mention. Rich was
+  planned as a Django app because a doc mentions Django.
+- **Identity.** The repo *is* the framework — unless a root manifest also
+  declares it as a dependency, which is exactly what separates
+  `laravel/laravel` (an app that requires `laravel/framework`) from
+  `pallets/flask` (whose only flask dependency lives under `examples/`).
+- **Structure.** No `main.go`, no app. The go/rust branches already reasoned
+  this way; the framework branch had been bypassing them.
+- **Monorepo roots.** A workspace root with nothing to start is not a service.
+
+Three more real bugs surfaced on the way:
+
+- **A devcontainer could never produce a run command.** `_from_devcontainer`
+  set base, env, steps, ports and archetype but never `run`, so any repo with a
+  `.devcontainer/` and a `postCreateCommand` planned as a web app with nothing
+  to launch. It describes a place to develop, not a service.
+- **`_parse_go` scanned the `module` line**, so `module github.com/gin-gonic/gin`
+  read as a dependency on gin.
+- **`_parse_python` grepped instead of parsing.** Flask's own pyproject says
+  "flask" four times — name, trove classifier, console script, coverage source
+  — and depends on it zero times. Now parsed with `tomllib`.
+- **Nested `package.json` scripts were merged into the root**, so
+  `@nestjs/core` appeared to have a start script belonging to a sample project.
+
+The linter and the planner now share one predicate (`_framework_implies_app`).
+A linter that asks a different question than the planner answers reports a
+contradiction every time the planner is correctly cautious.
+
+## Known misses, unfixed
+
+- **ripgrep** → `library`, should be `cli`. Cargo workspace whose binary lives
+  in a member crate; the root has no `src/main.rs`. This is the monorepo
+  limitation the README already documents, not a new one.
+- **fastapi-template** → `node`, should be `python`. The frontend outweighs the
+  backend by file count. Same limitation.
+- **micronaut-examples** → no language. A repo of independent example projects
+  with nothing at the root.
+
+All three are the same underlying gap: per-workspace planning. None produce a
+plan that contradicts itself — they produce an honest plan for the wrong
+subtree.
+
+---
+
 # Session 2 — executing it
 
 The note above says "**Execution does not [work]**… you need a Linux host". That

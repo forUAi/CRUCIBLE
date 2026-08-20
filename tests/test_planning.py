@@ -226,6 +226,125 @@ class TestPortDeconfliction(unittest.TestCase):
             self.assertEqual(3000, p.oracle.get("port"))
 
 
+class TestFrameworkSignalMeansAnApp(unittest.TestCase):
+    """Detecting a framework name is not the same as running the framework.
+
+    Every case here was found by the real-repo benchmark, not by reasoning:
+    once an empty run hint stopped discarding the archetype, framework repos
+    started planning as web apps built on themselves.
+    """
+
+    def _plan(self, files: dict[str, str]):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d)
+            for rel, body in files.items():
+                (t / rel).parent.mkdir(parents=True, exist_ok=True)
+                (t / rel).write_text(body)
+            ev = collect(str(t))
+            return ev, make_plan(ev)
+
+    def test_a_frameworks_own_repo_is_a_library(self):
+        """pallets/flask: name = "Flask", and no dependency on flask."""
+        ev, p = self._plan({
+            "pyproject.toml":
+                '[project]\nname = "Flask"\nversion = "3.2.0"\n'
+                'classifiers = ["Framework :: Flask"]\n'
+                'dependencies = ["werkzeug>=3.0", "jinja2>=3.1"]\n'
+                '\n[project.scripts]\nflask = "flask.cli:main"\n',
+            "src/flask/__init__.py": "",
+        })
+        self.assertEqual("library", p.archetype)
+        self.assertEqual("exit0", p.oracle.get("kind"))
+
+    def test_an_app_named_after_its_framework_is_still_an_app(self):
+        """laravel/laravel is called laravel AND requires laravel/framework."""
+        ev, p = self._plan({
+            "composer.json":
+                '{"name":"laravel/laravel","require":{"laravel/framework":"^11.0"}}',
+            "artisan": "<?php\n",
+            "public/index.php": "<?php\n",
+        })
+        self.assertEqual("web", p.archetype)
+        self.assertIn("artisan serve", p.run)
+
+    def test_a_doc_mention_is_not_a_dependency(self):
+        """Textualize/rich mentions Django in prose; it is not a Django app."""
+        ev, p = self._plan({
+            "pyproject.toml": '[project]\nname = "rich"\ndependencies = ["pygments"]\n',
+            "README.md": "Works great with django and flask projects.\n",
+            "rich/__init__.py": "# django integration notes\n",
+        })
+        self.assertEqual("library", p.archetype)
+
+    def test_pyproject_self_references_are_not_dependencies(self):
+        """The four ways flask's own pyproject says "flask" without depending on it."""
+        ev, _ = self._plan({
+            "pyproject.toml":
+                '[project]\nname = "Flask"\n'
+                'classifiers = ["Framework :: Flask"]\n'
+                'dependencies = ["click"]\n'
+                '\n[project.scripts]\nflask = "flask.cli:main"\n'
+                '\n[tool.coverage.run]\nsource = ["flask", "tests"]\n',
+        })
+        # The corpus grep may still mention it -- that signal is deliberately
+        # weak and `_framework_implies_app` rejects grep-only evidence. What
+        # must not happen is the *manifest* claiming a dependency it declares
+        # nowhere, because a manifest signal is the trusted kind.
+        self.assertNotIn("pyproject.toml", ev.why("framework", "flask"),
+                         "read the dependency table, do not grep the file")
+        from crucible.planner import _framework_implies_app
+        self.assertFalse(_framework_implies_app(ev, "flask", "python"))
+
+    def test_compiled_language_needs_an_entrypoint(self):
+        """gin-gonic/gin has no main.go, so it is the library, not a service."""
+        ev, p = self._plan({
+            "go.mod": "module github.com/gin-gonic/gin\n\ngo 1.22\n",
+            "gin.go": "package gin\n",
+        })
+        self.assertEqual("library", p.archetype)
+
+    def test_a_go_app_that_imports_gin_is_a_service(self):
+        ev, p = self._plan({
+            "go.mod": "module demo\n\ngo 1.22\n\n"
+                      "require github.com/gin-gonic/gin v1.10.0\n",
+            "main.go": "package main\n\nfunc main() {}\n",
+        })
+        self.assertEqual("web", p.archetype)
+        self.assertIn(8080, p.ports)
+
+    def test_nested_package_scripts_do_not_become_root_scripts(self):
+        ev, _ = self._plan({
+            "package.json": '{"name":"@acme/core","workspaces":["packages/*"]}',
+            "packages/sample/package.json":
+                '{"name":"sample","scripts":{"start":"node main.js"}}',
+        })
+        self.assertNotIn("start", ev.scripts)
+
+
+class TestDevcontainerIsNotAPlan(unittest.TestCase):
+    """A devcontainer describes a place to develop, not a service to run."""
+
+    def test_devcontainer_repo_still_gets_a_run_command(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d)
+            (t / ".devcontainer").mkdir()
+            (t / ".devcontainer/devcontainer.json").write_text(
+                '{"image":"mcr.microsoft.com/devcontainers/python:3.12",'
+                '"postCreateCommand":"pip install -e .","forwardPorts":[5000,8080]}')
+            (t / "pyproject.toml").write_text(
+                '[project]\nname = "widget"\ndependencies = ["click"]\n')
+            (t / "widget").mkdir()
+            (t / "widget/__init__.py").write_text("")
+            ev = collect(str(t))
+            p = make_plan(ev)
+            self.assertTrue(p.run.strip(), "a plan with no run verifies nothing")
+            self.assertEqual([], errors(lint(p, ev)))
+            # the author's setup step survives
+            self.assertTrue(any("pip install -e ." in s.cmd for s in p.steps))
+
+
 class TestLintCatchesTheOriginalBug(unittest.TestCase):
 
     def test_archetype_lost_is_an_error(self):
