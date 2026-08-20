@@ -144,6 +144,9 @@ class RunPlan:
     oracle: dict[str, Any] = field(default_factory=dict)
     provenance: list[str] = field(default_factory=list)
     generation: int = 0            # how many repairs deep we are
+    # ok | needs_configuration | ambiguous | unsupported. Never silently
+    # guessed past: an unresolved choice is a visible state, not a default.
+    status: str = "ok"
 
     def note(self, msg: str) -> None:
         self.provenance.append(msg)

@@ -819,7 +819,19 @@ def _oracle_for(arch: str, ports: list[int]) -> dict:
 
 
 def _merge_services(p: RunPlan, ev: Evidence) -> None:
+    optional = {s.value for s in ev.signals if s.kind == "service.optional"}
     wanted = {s.value for s in ev.signals if s.kind == "service"}
+    optional -= wanted
+    if optional and not wanted:
+        # Say so rather than guessing. Booting one of a set of mutually
+        # exclusive backends is a configuration decision, not an inference.
+        p.status = "needs_configuration"
+        p.note(f"optional backend(s) available but none active by default: "
+               f"{', '.join(sorted(optional))} -- the app runs on its built-in "
+               f"default unless a profile is selected")
+    elif optional:
+        p.note(f"not booting optional backend(s) {', '.join(sorted(optional))}; "
+               f"the default configuration names {', '.join(sorted(wanted))}")
     for name in sorted(wanted):
         if name not in SERVICE_IMAGES or any(s.name == name for s in p.services):
             continue

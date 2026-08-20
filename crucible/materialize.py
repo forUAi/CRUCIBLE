@@ -127,6 +127,7 @@ def to_lock(plan: RunPlan, evidence_fp: str, attempts: list, ledger=None) -> str
                     "runtime_egress_possible": ledger.runtime_egress_possible}
                    if ledger is not None else None),
         "version": 1,
+        "status": plan.status,
         "evidence_shape": evidence_fp,
         "plan_fingerprint": plan.fingerprint(),
         "repairs_applied": plan.generation,

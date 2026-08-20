@@ -786,11 +786,34 @@ def _parse_jvm(root: Path, ev: Evidence) -> None:
         if m := re.search(r"^\s*spring\.application\.name\s*[=:]\s*(\S+)", txt, re.M):
             add(Signal("jvm.appname", m.group(1).strip("'\""), 0.8, rel))
 
-    # ---- services, from JVM-shaped evidence ----------------------------
+    # ---- services: available vs required -------------------------------
+    #
+    # A driver on the classpath says the app CAN talk to that database, not
+    # that it must. Spring Petclinic declares both mysql-connector-j and
+    # org.postgresql so either profile works, and runs on in-memory H2 when
+    # you pick neither. Reading both as requirements booted two mutually
+    # exclusive databases for an app that needed none, and the run failed on
+    # a sidecar the repo never asked for.
+    #
+    # The requirement lives in configuration, and only in the DEFAULT
+    # configuration: application-mysql.properties describes a profile you
+    # have to opt into, so a datasource there is available, not active.
+    required: set[str] = set()
+    for rel in sorted(props, key=lambda f: f.count("/")):
+        if re.search(r"application-[\w]+\.(properties|ya?ml)$", rel):
+            continue                       # profile-specific: opt-in
+        txt = _read(root / rel, 80_000)
+        if rel.endswith((".yml", ".yaml")):
+            txt = txt + "\n" + _flatten_yaml(txt)
+        for pat, svc in JVM_SERVICE_PATTERNS:
+            if re.search(pat, txt, re.I):
+                required.add(svc)
+                add(Signal("service", svc, 0.95, rel))
+
     blob = "\n".join(jvm_corpus)
     for pat, svc in JVM_SERVICE_PATTERNS:
-        if re.search(pat, blob, re.I):
-            add(Signal("service", svc, 0.85, "<jvm manifests>"))
+        if svc not in required and re.search(pat, blob, re.I):
+            add(Signal("service.optional", svc, 0.85, "<jvm manifests>"))
 
 
 # ---------------------------------------------------------------------------

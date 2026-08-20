@@ -52,6 +52,16 @@ def _llm_from_env():
 
 
 def main(argv=None) -> int:
+    # Line-buffer stdout. Piped output is block-buffered by default, so a run
+    # that is killed -- OOM, timeout, SIGKILL -- loses its last buffer, and
+    # stderr (unbuffered) surfaces ahead of the stdout that explains it. A
+    # real ENOSPC crash showed its traceback above the evidence header that
+    # preceded it by two minutes, which is not a diagnosable artifact.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
+
     ap = argparse.ArgumentParser(
         prog="crucible", description="Run any repo in a sandbox. Learn how, then write it down.")
     ap.add_argument("target", help="path to a repo, or a git URL")
@@ -88,6 +98,8 @@ def main(argv=None) -> int:
         print(f"\n\033[1mplan\033[0m")
         for n in p.provenance:
             print(f"  · {n}")
+        if p.status != "ok":
+            print(f"\n  \033[33mstatus    {p.status.upper()}\033[0m")
         print(f"\n  base      {p.base}")
         print(f"  archetype {p.archetype}")
         print(f"  syspkgs   {', '.join(p.system_packages) or '—'}")
@@ -110,7 +122,11 @@ def main(argv=None) -> int:
     out = eng.run(repo, prefer=a.prefer)
 
     print("\n" + "─" * 68)
-    print(f"\033[1m{'SUCCESS' if out.ok else 'FAILED'}\033[0m  "
+    state = ("SUCCESS" if out.ok else
+             "EXHAUSTED" if getattr(out, "exhausted", False) else "FAILED")
+    if out.plan.status != "ok":
+        state += f" [{out.plan.status}]"
+    print(f"\033[1m{state}\033[0m  "
           f"{out.detail}   [{out.elapsed}s, {len(out.attempts)} attempt(s), "
           f"{out.steps_skipped} step(s) from cache]")
     for at in out.attempts:
