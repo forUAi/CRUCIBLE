@@ -47,11 +47,14 @@ SUITES = [
      False, "workspace discovery against pinned external repositories"),
     ("lifecycle", [sys.executable, "security/lifecycle_test.py", "--case", "all"],
      True, "crash cleanup, including the bystander safety case"),
-    ("execution", [sys.executable, "bench/execbench.py", "--repeat", "1"],
+    ("execution", [sys.executable, "bench/execbench.py", "--repeat", "1",
+                   "--out", "EVIDENCE/execution.json"],
      True, "four ecosystems actually build, launch and answer"),
-    ("networking", [sys.executable, "security/netmodes.py"], True,
+    ("networking", [sys.executable, "security/netmodes.py",
+                    "--out", "EVIDENCE/networking.json"], True,
      "hermetic denies egress, proxy routes through it, open permits it"),
-    ("resources", [sys.executable, "security/resources.py", "--case", "all"],
+    ("resources", [sys.executable, "security/resources.py", "--case", "all",
+                   "--out", "EVIDENCE/resources.json"],
      True, "cpu, memory, pids, disk, timeout and two concurrent boxes"),
     # Three repetitions each, from independent fresh stores. One passing run
     # is a sample, not a property.
@@ -159,6 +162,7 @@ def main() -> int:
     ap.add_argument("--only", help="comma-separated suite names")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--out")
+    ap.add_argument("--evidence", help="directory for full suite logs")
     a = ap.parse_args()
 
     artifact = Path(a.artifact).resolve()
@@ -199,6 +203,13 @@ def main() -> int:
     py = str(venv / "bin" / "python")
     print(f"venv      {py}")
 
+    # Outside the artifact: writing evidence into the tree under test would
+    # change its hash and be reported as the artifact mutating itself.
+    evidence = Path(a.evidence or (workdir.parent /
+                                   f"crucible-evidence-{digest[:12]}"))
+    evidence.mkdir(parents=True, exist_ok=True)
+    print(f"evidence  {evidence}")
+
     wanted = set(a.only.split(",")) if a.only else None
     results = []
     for name, argv, needs_root, why in SUITES:
@@ -210,13 +221,22 @@ def main() -> int:
             print(f"  ~ {name:20} SKIPPED (needs root)")
             continue
         cmd = [py if arg is sys.executable else arg for arg in argv]
+        cmd = [c.replace("EVIDENCE", str(evidence)) for c in cmd]
         t0 = time.time()
         r = subprocess.run(cmd, cwd=root, env=env, capture_output=True,
                            text=True, timeout=3600)
         secs = round(time.time() - t0, 1)
         ok = r.returncode == 0
+        # The FULL output, to a file outside the artifact. A 400-character
+        # tail lost the only record of why a target failed, and the failure
+        # did not reproduce -- so it could never be attributed to CRUCIBLE,
+        # the fixture, the repository or the machine. Evidence that survives
+        # only on success is not evidence.
+        log_path = evidence / f"{name}.log"
+        log_path.write_text(r.stdout + r.stderr)
         results.append({"suite": name, "outcome": "pass" if ok else "FAIL",
                         "rc": r.returncode, "seconds": secs, "why": why,
+                        "log": str(log_path),
                         "tail": (r.stdout + r.stderr)[-400:] if not ok else ""})
         print(f"  {'✓' if ok else '✗'} {name:20} "
               f"{'pass' if ok else 'FAIL rc=' + str(r.returncode):10} {secs:>7}s")
@@ -244,7 +264,8 @@ def main() -> int:
             {"artifact": str(artifact), "sha256": digest,
              "version": manifest["version"], "commit": manifest["source_commit"],
              "tree_hash_before": before, "tree_hash_after": after,
-             "mutated": mutated, "suites": results}, indent=2) + "\n")
+             "mutated": mutated, "evidence_dir": str(evidence),
+             "suites": results}, indent=2) + "\n")
     teardown(workdir, env, a.keep)
 
     return 1 if (failed or skipped or mutated) else 0
