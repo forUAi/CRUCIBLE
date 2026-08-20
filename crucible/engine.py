@@ -309,6 +309,23 @@ class Engine:
                     # bomb is killed by SIGXFSZ or refused with EDQUOT, and
                     # either way the previous message was just "unrepairable
                     # failure", which tells an operator nothing actionable.
+                    # A step that was refused egress and then failed did not
+                    # fail for the reason its output suggests. Under hermetic,
+                    # pip's "no matching distribution" is a symptom of the
+                    # policy, and the repair loop was diagnosing it as a
+                    # missing wheel and rebasing the image to chase it.
+                    if getattr(box, "_denied", {}).get(step.name):
+                        out.detail = (
+                            f"step `{step.name}` failed after the "
+                            f"`{self.policy.name}` policy denied it egress; "
+                            f"this is the policy, not the repository. Use "
+                            f"--network proxy or open, or pre-populate the "
+                            f"layer cache")
+                        att.failed_step = step.name
+                        att.diagnosis = f"denied by network policy {self.policy.name}"
+                        out.attempts.append(att)
+                        self.log(f"\033[31m  ✗ {out.detail}\033[0m")
+                        break
                     if self._hit_disk_budget(box, res):
                         b = box.budget
                         out.detail = (f"disk budget exceeded: the sandbox was "
