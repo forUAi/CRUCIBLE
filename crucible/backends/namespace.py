@@ -116,7 +116,15 @@ def ensure_private_store(size_mb: int = 4096, log=print) -> None:
         _STORE_READY = True
         return
 
-    img = STATE_ROOT.parent / "crucible-store.img"
+    # The backing file lives beside STATE_ROOT (it cannot live inside a
+    # directory it is about to be mounted over), and its NAME must encode the
+    # state root. Two state roots under the same parent -- /var/lib/crucible,
+    # /var/lib/crucible-conc-0, /var/lib/crucible-conc-1 -- otherwise all
+    # resolve to /var/lib/crucible-store.img, so concurrent boxes silently
+    # shared one ext4 image: the second mounted box 0's filesystem a second
+    # time and neither had an independent store. `crucible` still yields the
+    # existing `crucible-store.img`, so the warm cache path is unchanged.
+    img = STATE_ROOT.parent / f"{STATE_ROOT.name}-store.img"
     have_loop = shutil.which("losetup") and shutil.which("mkfs.ext4")
     if have_loop:
         try:

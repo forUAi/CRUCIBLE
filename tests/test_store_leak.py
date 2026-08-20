@@ -172,5 +172,39 @@ class TestImageCacheIsShared(unittest.TestCase):
         importlib.reload(importlib.import_module("crucible.backends.namespace"))
 
 
+class TestStoreImageIsPerStateRoot(unittest.TestCase):
+    """Concurrent boxes must not share one backing image.
+
+    The image name derived from STATE_ROOT.parent alone, so every state root
+    under /var/lib collapsed onto /var/lib/crucible-store.img. Two concurrent
+    boxes then mounted the same ext4 twice and neither had an independent
+    store -- which is why the concurrent resource case read 0 MB for both.
+    """
+
+    def _img_for(self, state_root: str) -> str:
+        import importlib
+        import os
+        with mock.patch.dict(os.environ, {"CRUCIBLE_STATE": state_root}):
+            ns = importlib.reload(
+                importlib.import_module("crucible.backends.namespace"))
+            img = ns.STATE_ROOT.parent / f"{ns.STATE_ROOT.name}-store.img"
+        importlib.reload(importlib.import_module("crucible.backends.namespace"))
+        return str(img)
+
+    def test_distinct_roots_get_distinct_images(self):
+        a = self._img_for("/var/lib/crucible-conc-0")
+        b = self._img_for("/var/lib/crucible-conc-1")
+        main = self._img_for("/var/lib/crucible")
+        self.assertNotEqual(a, b, "concurrent boxes must not share a store image")
+        self.assertNotEqual(a, main)
+        self.assertNotEqual(b, main)
+
+    def test_default_root_keeps_the_warm_cache_path(self):
+        # The whole point of encoding the name this way is to NOT invalidate
+        # the existing warm cache.
+        self.assertEqual("/var/lib/crucible-store.img",
+                         self._img_for("/var/lib/crucible"))
+
+
 if __name__ == "__main__":
     unittest.main()
