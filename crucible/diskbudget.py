@@ -118,12 +118,21 @@ def apply(box_dir: Path, box_id: str, limit_mb: int, mountpoint: Path,
     proj = project_id_for(box_id)
     box_dir.mkdir(parents=True, exist_ok=True)
 
-    # -p sets the project, +P makes it inherit, so files created later are
-    # covered too. Without inheritance the limit applies to an empty directory
-    # and nothing else, which is the vacuous version of this feature.
-    r = _sh(f"chattr -R -p {proj} {box_dir} && chattr -R +P {box_dir}")
+    # -p sets the project on everything; +P makes directories propagate it to
+    # what is created inside them later. Without inheritance the limit applies
+    # to whatever exists right now and nothing else, which is the vacuous
+    # version of this feature.
+    #
+    # +P is valid only on DIRECTORIES. `chattr -R +P` walks into regular files
+    # and fails with "Operation not supported", which silently left the whole
+    # budget unenforced -- the failure was reported, but on the file, so it
+    # read like a filesystem problem rather than a misuse of the flag.
+    r = _sh(f"chattr -R -p {proj} {box_dir}")
     if r.returncode != 0:
-        return BudgetState(False, f"chattr failed: {r.stderr.strip()[:80]}")
+        return BudgetState(False, f"chattr -p failed: {r.stderr.strip()[:80]}")
+    r = _sh(f"find {box_dir} -type d -print0 | xargs -0 -r chattr +P")
+    if r.returncode != 0:
+        return BudgetState(False, f"chattr +P failed: {r.stderr.strip()[:80]}")
 
     blocks = limit_mb * 1024                      # setquota speaks 1K blocks
     r = _sh(f"setquota -P {proj} 0 {blocks} 0 0 {mountpoint}")
