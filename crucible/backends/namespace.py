@@ -157,6 +157,7 @@ class NamespaceBackend(SandboxBackend):
         from ..diskbudget import BudgetState
         self.budget = BudgetState(False, "not applied")
         self.dir = STATE_ROOT / box_id
+        self.log_dir = STATE_ROOT / "logs" / box_id
         self.base_dir = self.dir / "base"
         # Layers are content-addressed by CHAIN hash and shared across boxes and
         # across runs, so a step proven good once is never re-executed. Keying
@@ -190,6 +191,7 @@ class NamespaceBackend(SandboxBackend):
         # the store over /var/lib/crucible then shadowed it -- so the tree the
         # quota was applied to was not always the tree the sandbox used.
         ensure_private_store(self.store_mb, self.log)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         self._claim()
         for d in (self.layers_dir, self.merged):
             d.mkdir(parents=True, exist_ok=True)
@@ -252,6 +254,7 @@ class NamespaceBackend(SandboxBackend):
     def destroy(self) -> None:
         self.down()
         shutil.rmtree(self.dir, ignore_errors=True)
+        shutil.rmtree(self.log_dir, ignore_errors=True)
 
     def _claim(self) -> None:
         """Stamp this box with the pid that owns it, so a later run can tell
@@ -461,7 +464,14 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         # descriptor a grandchild controlled. Reading a file removes the
         # dependency entirely: nothing a descendant does can block the
         # supervisor, and the deadline is the only thing that decides.
-        logpath = self.dir / f"step-{step.name.replace('/', '_')}.log"
+        # OUTSIDE the box's quota project, deliberately. The log used to live
+        # in self.dir, which is exactly the tree the budget caps -- so when a
+        # repository exhausted its budget, the write that would have recorded
+        # WHY failed too. The step exited 1 having said nothing at all, and
+        # the run reported an unrepairable repository instead of an exhausted
+        # sandbox. Evidence cannot live inside the resource the workload is
+        # allowed to consume.
+        logpath = self.log_dir / f"step-{step.name.replace('/', '_')}.log"
         try:
             logpath.parent.mkdir(parents=True, exist_ok=True)
             sink = open(logpath, "wb")

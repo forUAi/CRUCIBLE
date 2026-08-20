@@ -253,7 +253,7 @@ class Engine:
         registry = lifecycle.Registry(STATE_ROOT)
         run_id = box.id
         record = registry.open(run_id, cgroup=self._require_cgroup(box))
-        record.dirs = [str(box.dir)]
+        record.dirs = [str(box.dir), str(box.log_dir)]
         registry.write(record)
         # _verify_run creates the pod later; it must be able to declare that
         # directory as owned too. The pod dir was the one resource the crash

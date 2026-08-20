@@ -4,7 +4,13 @@ Deliberately not a small successful write: a disk-limit test that writes 1 MB
 and declares victory proves nothing. This writes in 8 MiB chunks until the
 kernel refuses, then says which errno refused it.
 """
-import errno, json, os, sys
+import errno, json, os, signal, sys
+
+# RLIMIT_FSIZE raises SIGXFSZ, whose default action is to kill the process
+# before it can say anything. Ignore it so the write returns EFBIG as an
+# ordinary error and this fixture can report which control actually bound --
+# a probe that dies silently proves nothing about the limit that killed it.
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
 
 CEILING_MB = 20_000          # far above any budget; the kernel should stop us first
 written = 0
