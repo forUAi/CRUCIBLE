@@ -126,6 +126,7 @@ class NamespaceBackend(SandboxBackend):
         self.pod = None                     # optional shared-netns Pod
         self.dns = None                     # optional DnsLedger
         self.peers: dict = {}               # (ip, port) -> first seen
+        self.image_env: dict[str, str] = {}  # ENV declared by the base image
         self._mounted = False
         self._cg: list[Path] = []
 
@@ -147,11 +148,21 @@ class NamespaceBackend(SandboxBackend):
             self.base_dir = Path("/")
             self.log(f"  base: host rootfs (read-only lower)")
         else:
-            from ..oci import cache_dir_for, pull_rootfs
+            from ..oci import cache_dir_for, image_config, pull_rootfs
             cache = cache_dir_for(STATE_ROOT, base)
             self.log(f"  base: pulling {base}")
             pull_rootfs(base, str(cache), log=self.log)
             self.base_dir = cache
+            # An image's config blob is part of the image, not decoration.
+            # eclipse-temurin declares JAVA_HOME there and puts the JDK on
+            # PATH; ignoring it meant ./mvnw died with "JAVA_HOME is not
+            # defined correctly" on the very base chosen to provide Java.
+            # pod.py already reads this for sidecars -- the app never did.
+            cfg = image_config(str(cache)) or {}
+            self.image_env = _env_list_to_dict(
+                ((cfg.get("config") or cfg.get("Config") or {}).get("Env")) or [])
+            if self.image_env:
+                self.log(f"  image env: {', '.join(sorted(self.image_env))}")
 
         self._fresh_live()
         self._mount()
@@ -337,6 +348,7 @@ class NamespaceBackend(SandboxBackend):
             "HOME": "/root", "TERM": "xterm", "LANG": "C.UTF-8",
             "DEBIAN_FRONTEND": "noninteractive", "PYTHONUNBUFFERED": "1",
             "CI": "1", "NO_COLOR": "1",
+            **self.image_env,           # the base image speaks for itself
             **self._ca_env(), **env, **step.env,
         }
         exports = "\n".join(
@@ -407,6 +419,7 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         """Start a long-running process (the `run` command) without waiting."""
         merged_env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                       "HOME": "/root", "PYTHONUNBUFFERED": "1",
+                      **self.image_env,
                       **self._ca_env(), **env, **step.env}
         exports = "\n".join(f"export {k}={_q(v)}" for k, v in merged_env.items())
         script = (f"#!/bin/sh\nmount -t proc proc /proc 2>/dev/null\n"
@@ -534,6 +547,17 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
                      f"asked for `{' '.join(pkgs)}` did not take effect")
             for line in res.tail(4).splitlines():
                 self.log(f"    {line}")
+
+
+def _env_list_to_dict(items) -> dict[str, str]:
+    """OCI config Env is a list of KEY=VALUE strings."""
+    out: dict[str, str] = {}
+    for item in items or []:
+        if isinstance(item, str) and "=" in item:
+            k, _, v = item.partition("=")
+            if k:
+                out[k] = v
+    return out
 
 
 def _q(v: str) -> str:
