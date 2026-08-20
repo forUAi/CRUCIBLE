@@ -375,8 +375,10 @@ class Engine:
             if e.errno not in (errno.ENOSPC, errno.EDQUOT, errno.EMFILE, errno.ENFILE):
                 raise
             name = errno.errorcode.get(e.errno, str(e.errno))
+            hint = ("--disk-mb (this sandbox's budget)" if e.errno == errno.EDQUOT
+                    else "--store-mb (the shared layer store)")
             out.detail = (f"sandbox resource exhausted ({name}): {e}. "
-                          f"The layer store is capped; raise it with --store-mb.")
+                          f"Raise {hint}.")
             out.exhausted = True
             self.log(f"\033[31m  ✗ {out.detail}\033[0m")
         finally:
