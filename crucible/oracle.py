@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import shutil
 import socket
+import os
 import subprocess
+from pathlib import Path
 import time
 from dataclasses import dataclass
 
@@ -69,6 +71,39 @@ def _probe_direct(port: int, timeout: float = 1.5) -> tuple[bool, str]:
         return False, str(e)
 
 
+def machine_pressure() -> dict:
+    """Load and free memory, sampled when a probe is about to give up.
+
+    An oracle that times out reports a verdict about the repository. That is
+    only honest if the machine was healthy: the node target was recorded as
+    `failed` once, at 57s, while three repositories were being cloned and the
+    page cache was churning -- and it verified in 12.8s on the next two runs.
+    A timing failure attributed to the repository is a wrong answer, not a
+    conservative one.
+    """
+    out = {"load1": None, "avail_mb": None, "runq": None}
+    try:
+        parts = Path("/proc/loadavg").read_text().split()
+        out["load1"] = float(parts[0])
+        out["runq"] = parts[3]
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                out["avail_mb"] = int(line.split()[1]) // 1024
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    return out
+
+
+def under_pressure(p: dict, cpus: int = 0) -> bool:
+    cpus = cpus or (os.cpu_count() or 1)
+    return bool((p.get("load1") or 0) > cpus * 1.5
+                or (p.get("avail_mb") is not None and p["avail_mb"] < 256))
+
+
 def verify(spec: dict, proc: subprocess.Popen | None, log_tail=lambda: "") -> Verdict:
     kind = spec.get("kind", "exit0")
 
@@ -87,6 +122,17 @@ def verify(spec: dict, proc: subprocess.Popen | None, log_tail=lambda: "") -> Ve
             if ok:
                 return Verdict(True, f"port {port} answered", detail)
             time.sleep(1.0)
+        # Attribute the failure before returning it. A grace period that
+        # expires on a loaded machine is a statement about the machine.
+        press = machine_pressure()
+        if under_pressure(press):
+            return Verdict(
+                False,
+                f"INCONCLUSIVE: nothing listening on {port} after {grace:.0f}s, "
+                f"but the machine was under pressure (load1={press['load1']}, "
+                f"{press['avail_mb']} MB available) -- this is not a verdict "
+                f"about the repository",
+                last or log_tail())
         return Verdict(False, f"nothing listening on {port} after {grace:.0f}s", last or log_tail())
 
     # ---- worker/daemon: survive without crashing ----
