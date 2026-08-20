@@ -497,7 +497,11 @@ def _go_mains(base: Path, limit: int = 400) -> list[str]:
                        and d.lower() not in NON_DEPLOYABLE_SEGMENTS
                        and not (Path(dirpath) / d / "go.mod").exists()]
         for f in filenames:
-            if not f.endswith(".go"):
+            # A `package main` in a _test.go file is a test harness, not the
+            # module's entry point. Prometheus was cited as runnable on the
+            # evidence of cmd/prometheus/reload_test.go, which is the right
+            # answer reached through the wrong file.
+            if not f.endswith(".go") or f.endswith("_test.go"):
                 continue
             n += 1
             if n > limit:
