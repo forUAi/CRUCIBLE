@@ -49,14 +49,34 @@ TARGETS = [
 ]
 
 
+def resolve(path: str) -> Path:
+    """Expand ~ against the invoking user, not root.
+
+    execbench runs under sudo, where Path.expanduser() resolves ~ to /root and
+    every guest-local target silently vanished. All three non-example targets
+    reported `failed` in 0.0s, which is also the wrong *word*: a path that
+    does not exist is a harness error, not a repository that will not build.
+    """
+    import os
+    if path.startswith("~"):
+        home = (Path("/home") / os.environ["SUDO_USER"] if os.environ.get("SUDO_USER")
+                else Path.home())
+        return home / path.lstrip("~/")
+    return Path(path)
+
+
 def run_one(path: str, budget: int, timeout: int) -> dict:
+    target = resolve(path)
+    if not target.is_dir():
+        return {"outcome": "harness_error", "seconds": 0.0,
+                "detail": f"target does not exist: {target}"}
     Path("/var/lib/crucible").mkdir(parents=True, exist_ok=True)
     subprocess.run("rm -rf /var/lib/crucible/layers /var/lib/crucible/plans",
                    shell=True, capture_output=True)
     t0 = time.time()
     try:
         r = subprocess.run(
-            [sys.executable, "-u", "-m", "crucible.cli", str(Path(path).expanduser()),
+            [sys.executable, "-u", "-m", "crucible.cli", str(target),
              "--no-llm", "--budget", str(budget), "--no-cache",
              "--step-timeout", str(timeout)],
             cwd=ROOT, capture_output=True, text=True, timeout=timeout * 3)
@@ -109,6 +129,9 @@ def main() -> int:
                 print(f"      repair: {rp[:70]}")
 
     print("─" * 92)
+    bad = [r for r in rows if r["outcome"] == "harness_error"]
+    for r in bad:
+        print(f"  !! harness error, not a result: {r['detail']}")
     ok = sum(1 for r in rows if r["outcome"] == r["expect"])
     by_target: dict[str, set] = {}
     for r in rows:
@@ -122,7 +145,7 @@ def main() -> int:
     if a.out:
         Path(a.out).write_text(json.dumps(
             {"rows": rows, "nondeterministic": flaky}, indent=2) + "\n")
-    return 0 if ok == len(rows) and not flaky else 1
+    return 0 if ok == len(rows) and not flaky and not bad else 1
 
 
 if __name__ == "__main__":
