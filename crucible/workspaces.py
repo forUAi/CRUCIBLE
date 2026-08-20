@@ -55,6 +55,11 @@ SKIP_DIRS = {
     "build", ".next", ".nuxt", "vendor", ".tox", ".gradle", ".idea", "out",
     "coverage", ".svelte-kit", ".turbo", ".yarn", "third_party",
 }
+# A manifest inside one of these belongs to source, not to a project. Vue
+# ships packages-private/sfc-playground/src/download/template/package.json as
+# a template FILE; reporting it as a workspace is a category error.
+INNER_SEGMENTS = {"src", "lib", "templates", "template", "__tests__",
+                  "test-fixtures", "testdata", "generators", "blueprints"}
 MAX_DEPTH = 6
 MAX_MANIFESTS = 4000
 
@@ -159,6 +164,9 @@ def _walk_manifests(root: Path) -> tuple[dict[str, list[str]], bool]:
         if depth >= MAX_DEPTH:
             dirnames.clear()
         here = [f for f in sorted(filenames) if f in MANIFEST_KIND]
+        parts = [] if rel_dir == "." else rel_dir.split(os.sep)
+        if any(seg in INNER_SEGMENTS for seg in parts[:-1]):
+            here = []          # inside another project's source tree
         if here:
             found[rel_dir if rel_dir != "." else "."] = here
             count += len(here)
@@ -184,8 +192,19 @@ def _match_members(root: Path, patterns: list[str]) -> list[str]:
 
     candidates: set[str] = set()
     for pat in include:
+        pat = str(pat).strip().strip("/")
+        # apache/airflow lists "." as a member. pathlib refuses it as a glob
+        # and the whole discovery crashed; a malformed member entry is the
+        # repository's business, not a reason to fail the repository.
+        if not pat or pat == ".":
+            candidates.add(".")
+            continue
         # `apps/*` means directories, not files; `examples` means that one dir.
-        for hit in sorted(root.glob(pat)):
+        try:
+            hits = sorted(root.glob(pat))
+        except (ValueError, OSError, IndexError):
+            continue
+        for hit in hits:
             if hit.is_dir() and not any(part in SKIP_DIRS for part in hit.parts):
                 candidates.add(str(hit.relative_to(root)))
     for pat in exclude:
@@ -383,7 +402,15 @@ def _classify(root: Path, w: Workspace, manifests: list[str]) -> None:
         # reading that script as a service produced 193 of them.
         entry = next((k for k in ("main", "module", "exports", "types")
                       if data.get(k)), None)
-        if entry and not data.get("bin"):
+        # ...but only where it is genuinely an entry point for a CONSUMER.
+        # heroku/node-js-getting-started is `private: true` with `main:
+        # index.js` and `start: node index.js` -- a standalone app that names
+        # its own entry file, not a package anyone imports. Applying the rule
+        # to it rejected an application CRUCIBLE demonstrably runs. The two
+        # signals that make it a library are being a declared member of a
+        # workspace (something in this repo consumes it) or being publishable.
+        consumed = bool(w.declared_by) or not data.get("private")
+        if entry and consumed and not data.get("bin"):
             w.role = "library"
             w.rejected_because = (f"publishes a library entry point "
                                   f"(`{entry}`) and declares no `bin`")
