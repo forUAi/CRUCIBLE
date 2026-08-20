@@ -16,6 +16,8 @@ guest. It checks that the map corresponds to the territory.
 
 from __future__ import annotations
 
+import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -45,12 +47,29 @@ def resolve(ref: str) -> tuple[bool, str]:
     return True, ""
 
 
+ASSERTS = re.compile(r"^ASSERTS: (.+)$", re.M)
+
+
+def load_results(path: str) -> tuple[dict, str, str]:
+    """Suite -> outcome, plus the artifact identity the run was made against."""
+    data = json.loads(Path(path).read_text())
+    suites = {s["suite"]: s["outcome"] for s in data.get("suites", [])}
+    return suites, data.get("sha256", ""), data.get("version", "")
+
+
 def main() -> int:
     text = TM.read_text()
     claims = CLAIM.findall(text)
     blocks = CLAIM.split(text)[1:]
 
-    verified, unverified, broken = [], [], []
+    ap = argparse.ArgumentParser(prog="tm_check")
+    ap.add_argument("--results", help="release verification JSON")
+    a = ap.parse_args()
+    suites, sha, ver = load_results(a.results) if a.results else ({}, "", "")
+    if a.results:
+        print(f"against artifact crucible-{ver} sha256:{sha[:16]}…")
+
+    verified, unverified, broken, unexecuted = [], [], [], []
     for i in range(0, len(blocks), 3):
         cid, title, body = blocks[i], blocks[i + 1], blocks[i + 2]
         if "UNVERIFIED" in body:
@@ -66,10 +85,29 @@ def main() -> int:
             ok, why = resolve(r)
             if not ok:
                 broken.append((cid, title, why))
+
+        # A file that exists proves nothing ran. When a results file is
+        # supplied, the named suite must have executed and passed in it.
+        am = ASSERTS.search(body)
+        if not am:
+            broken.append((cid, title, "no ASSERTS: line naming an assertion"))
+        elif a.results:
+            suite = am.group(1).split("::")[0].strip()
+            outcome = suites.get(suite)
+            if outcome is None:
+                unexecuted.append((cid, title, f"{suite} did not run"))
+            elif outcome != "pass":
+                unexecuted.append((cid, title, f"{suite} -> {outcome}"))
         verified.append((cid, title))
 
-    print(f"{len(claims)} claims: {len(verified)} with evidence, "
-          f"{len(unverified)} UNVERIFIED, {len(broken)} broken")
+    proven = len(verified) - len(unexecuted)
+    print(f"{len(claims)} claims: "
+          + (f"{proven} PROVEN by an executed suite, " if a.results else
+             f"{len(verified)} with resolving references, ")
+          + f"{len(unverified)} UNVERIFIED, {len(broken)} broken"
+          + (f", {len(unexecuted)} unexecuted" if unexecuted else ""))
+    for cid, title, why in unexecuted:
+        print(f"  \033[33m~ {cid}\033[0m {title} — {why}")
     for cid, title in unverified:
         print(f"  \033[33m? {cid}\033[0m {title}")
     for cid, title, why in broken:
@@ -78,7 +116,7 @@ def main() -> int:
     if not claims:
         print("  ✗ no claims parsed; the format changed")
         return 1
-    return 1 if broken else 0
+    return 1 if (broken or unexecuted) else 0
 
 
 if __name__ == "__main__":

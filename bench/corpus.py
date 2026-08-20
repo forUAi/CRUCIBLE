@@ -20,7 +20,13 @@ they cannot drift toward whatever makes a number look better:
 
     dev         tune freely
     validation  check generalisation while iterating
-    holdout     LOCKED. Not inspected, not tuned against.
+    holdout     CONSUMED at checkpoint 1. It was run once, it disagreed on
+                prometheus, and that disagreement was adjudicated into a
+                label change -- so it has influenced the product and can no
+                longer measure generalisation. Its result stands as recorded;
+                it is not a clean holdout any more.
+    sealed      LOCKED for the next checkpoint. Never run, never inspected.
+                wsbench refuses it outright, with no --unlock escape.
 
 `expect` records only what can be asserted with confidence from the
 repository's own declarations. Where the honest answer is "a human would have
@@ -52,10 +58,26 @@ class Repo:
     must_exclude: list[str] = field(default_factory=list)
     rationale: str = ""
 
+    sealed: bool = False               # reserved for the next checkpoint
+
     @property
     def split(self) -> str:
+        if self.sealed:
+            return "sealed"
         h = int(hashlib.sha256(self.slug.encode()).hexdigest()[:8], 16)
         return ("dev", "validation", "holdout")[h % 3]
+
+
+# Checkpoint 1's holdout is consumed: it ran, it disagreed on prometheus, and
+# the adjudication changed a label. Recording that here rather than in a
+# commit message, because the next person to read a holdout number needs to
+# know which one they are looking at.
+HOLDOUT_CONSUMED = {
+    "checkpoint": 1,
+    "result": "6/6 scored, root_runnable 4/5 (80%), all other checks 100%",
+    "why_consumed": "the prometheus disagreement was adjudicated into a "
+                    "corrected label, so the split influenced the product",
+}
 
 
 # --------------------------------------------------------------------------
@@ -71,8 +93,8 @@ CORPUS: list[Repo] = [
          languages=["python"], root_runnable=False, max_runnable=0,
          rationale="framework source whose examples/ depend on flask"),
     Repo("django/django", "https://github.com/django/django", "python", "framework",
-         languages=["python"], root_runnable=False,
-         rationale="framework with a large tests/ tree"),
+         languages=["python"], root_runnable=False, max_runnable=0,
+         rationale="framework; no manage.py and no application in the tree"),
     Repo("Textualize/rich", "https://github.com/Textualize/rich", "python", "framework",
          languages=["python"], root_runnable=False, max_runnable=0,
          rationale="library that mentions web frameworks in prose"),
@@ -82,12 +104,14 @@ CORPUS: list[Repo] = [
          must_include=["backend", "frontend"],
          rationale="frontend/backend pair; root is not the application"),
     Repo("netbox-community/netbox", "https://github.com/netbox-community/netbox",
-         "python", "app", languages=["python"],
-         rationale="substantial Django application"),
+         "python", "app", languages=["python"], root_runnable=False, min_runnable=1,
+         rationale="Django app whose manage.py is at netbox/netbox/, so the repository root is not the application"),
     Repo("apache/airflow", "https://github.com/apache/airflow", "python", "monorepo",
-         languages=["python"], rationale="multi-package Python repository"),
+         languages=["python"], root_runnable=False,
+         rationale="multi-package repository; the root is not the application"),
     Repo("pypa/pipenv", "https://github.com/pypa/pipenv", "python", "tool",
-         languages=["python"], rationale="Python CLI tool"),
+         languages=["python"], min_runnable=1,
+         rationale="CLI tool with a declared console entry point"),
 
     # ---------------- Java ----------------
     Repo("spring-projects/spring-petclinic",
@@ -134,11 +158,21 @@ CORPUS: list[Repo] = [
          languages=["go"], root_runnable=False,
          must_exclude=["interop/observability", "interop/xds"],
          rationale="ten nested modules, no go.work; mains live in interop/"),
+    # ADJUDICATED after the first holdout run disagreed. The label was wrong.
+    # It conflated "the root PACKAGE is a library" (true: no .go at the top
+    # level) with "the root WORKSPACE is not runnable" (false). The author's
+    # own go.work lists "." as a member, and the Makefile builds cmd/prometheus
+    # and cmd/promtool from that module. CRUCIBLE's unit is the module, and its
+    # documented Go rule -- entry point at the module root or under cmd/ -- is
+    # standard Go layout. Corrected on that evidence, not on the score.
     Repo("prometheus/prometheus", "https://github.com/prometheus/prometheus",
-         "go", "app", languages=["go"], root_runnable=False, min_runnable=1,
-         rationale="binaries under cmd/; root package is a library"),
+         "go", "app", languages=["go"], root_runnable=True, min_runnable=1,
+         must_include=["."],
+         rationale="go.work declares '.'; the Makefile builds cmd/prometheus "
+                   "and cmd/promtool from the root module"),
     Repo("go-gitea/gitea", "https://github.com/go-gitea/gitea", "go", "app",
-         languages=["go"], rationale="large Go service"),
+         languages=["go"], root_runnable=True, min_runnable=1, must_include=["."],
+         rationale="main.go at the module root"),
     Repo("heroku/go-getting-started", "https://github.com/heroku/go-getting-started",
          "go", "app", languages=["go"], root_runnable=True, min_runnable=1,
          rationale="small runnable Go web app; known-good execution case"),
@@ -149,7 +183,8 @@ CORPUS: list[Repo] = [
          "go", "framework", languages=["go"], root_runnable=False,
          rationale="negative control: client library with examples/"),
     Repo("hashicorp/consul", "https://github.com/hashicorp/consul", "go", "monorepo",
-         languages=["go"], rationale="multi-module Go repository"),
+         languages=["go"], root_runnable=True, min_runnable=1, must_include=["."],
+         rationale="main.go at the module root, plus nested modules"),
 
     # ---------------- Node / TypeScript ----------------
     Repo("expressjs/express", "https://github.com/expressjs/express", "node", "framework",
@@ -186,6 +221,56 @@ CORPUS: list[Repo] = [
          rationale="negative control: pnpm framework monorepo; root deploys "
                    "nothing, though it does contain runnable playgrounds"),
 ]
+
+
+# --------------------------------------------------------------------------
+# SEALED for checkpoint 2. Chosen to cover the same shapes as the consumed
+# holdout -- an application, a framework negative control, a monorepo and a
+# nested-module case in each band -- and deliberately NOT looked at. No
+# labels beyond language and shape are recorded yet, because writing a
+# ground-truth label requires opening the repository.
+# --------------------------------------------------------------------------
+
+SEALED: list[Repo] = [
+    Repo("tiangolo/sqlmodel", "https://github.com/tiangolo/sqlmodel",
+         "python", "framework", sealed=True, languages=["python"],
+         rationale="sealed: python library negative control"),
+    Repo("Pylons/pyramid", "https://github.com/Pylons/pyramid",
+         "python", "framework", sealed=True, languages=["python"],
+         rationale="sealed: python web framework negative control"),
+    Repo("saleor/saleor", "https://github.com/saleor/saleor",
+         "python", "app", sealed=True, languages=["python"],
+         rationale="sealed: large Django application"),
+    Repo("quarkusio/quarkus", "https://github.com/quarkusio/quarkus",
+         "java", "monorepo", sealed=True, languages=["java"],
+         rationale="sealed: very large maven reactor"),
+    Repo("micronaut-projects/micronaut-core",
+         "https://github.com/micronaut-projects/micronaut-core",
+         "java", "framework", sealed=True, languages=["java"],
+         rationale="sealed: gradle multi-project framework"),
+    Repo("jenkinsci/jenkins", "https://github.com/jenkinsci/jenkins",
+         "java", "app", sealed=True, languages=["java"],
+         rationale="sealed: maven multi-module application"),
+    Repo("etcd-io/etcd", "https://github.com/etcd-io/etcd",
+         "go", "nested", sealed=True, languages=["go"],
+         rationale="sealed: go.work with several nested modules"),
+    Repo("cli/cli", "https://github.com/cli/cli", "go", "app", sealed=True,
+         languages=["go"], rationale="sealed: Go CLI with cmd/ layout"),
+    Repo("uber-go/zap", "https://github.com/uber-go/zap", "go", "framework",
+         sealed=True, languages=["go"],
+         rationale="sealed: Go library negative control"),
+    Repo("vitejs/vite", "https://github.com/vitejs/vite", "node", "monorepo",
+         sealed=True, languages=["node"],
+         rationale="sealed: pnpm monorepo of packages"),
+    Repo("strapi/strapi", "https://github.com/strapi/strapi", "node",
+         "monorepo", sealed=True, languages=["node"],
+         rationale="sealed: yarn monorepo with an application"),
+    Repo("fastify/fastify", "https://github.com/fastify/fastify", "node",
+         "framework", sealed=True, languages=["node"],
+         rationale="sealed: node framework negative control"),
+]
+
+CORPUS.extend(SEALED)
 
 
 def by_split(split: str) -> list[Repo]:

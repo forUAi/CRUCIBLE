@@ -99,9 +99,19 @@ def main() -> int:
     a = ap.parse_args()
 
     splits = [s.strip() for s in a.split.split(",")]
+    if "sealed" in splits:
+        sys.exit("the sealed split is reserved for the next checkpoint and has "
+                 "no unlock. Running it here would consume it exactly as the "
+                 "checkpoint-1 holdout was consumed")
     if "holdout" in splits and not a.unlock:
         sys.exit("refusing to run the holdout without --unlock; its value is "
                  "entirely in not having looked at it")
+    if "holdout" in splits:
+        from bench.corpus import HOLDOUT_CONSUMED
+        print(f"NOTE: this holdout was CONSUMED at checkpoint "
+              f"{HOLDOUT_CONSUMED['checkpoint']} -- "
+              f"{HOLDOUT_CONSUMED['why_consumed']}. It no longer measures "
+              f"generalisation; use the sealed split at the next checkpoint.\n")
 
     repos = [r for r in CORPUS if r.split in splits]
     rows = [score_one(r) for r in repos]

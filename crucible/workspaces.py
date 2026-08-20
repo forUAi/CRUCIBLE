@@ -97,6 +97,10 @@ class Workspace:
     depends_on: list[str] = field(default_factory=list)
     reasons: list[Reason] = field(default_factory=list)
     rejected_because: str = ""
+    # True when the role came from "there is a project of this kind here"
+    # rather than from a specific declaration. Weak roles are adjudicated by
+    # the planner; strong ones (a `bin`, a start script, package main) stand.
+    weak: bool = False
     status: str = "ok"                          # ok|ambiguous|unsupported|needs_configuration
     confidence: float = 0.0
 
@@ -148,6 +152,10 @@ MANIFEST_KIND = {
     "Gemfile": ("ruby", "bundler"),
     "composer.json": ("php", "composer"),
     "mix.exs": ("elixir", "mix"),
+    # Not a manifest, but it is how a Django project declares itself, and it
+    # is frequently nested: netbox keeps it at netbox/netbox/manage.py, so a
+    # manifest-only scan found no application in a Django application.
+    "manage.py": ("python", "django"),
 }
 
 
@@ -345,7 +353,7 @@ def _pom_modules(pom: Path) -> list[str]:
 # roles
 # ---------------------------------------------------------------------------
 
-def _classify(root: Path, w: Workspace, manifests: list[str]) -> None:
+def _classify_one(root: Path, w: Workspace, manifests: list[str]) -> None:
     """Assign a role, recording what decided it."""
     base = root / ("" if w.path == "." else w.path)
     segs = {s.lower() for s in Path(w.path).parts if s != "."}
@@ -453,19 +461,35 @@ def _classify(root: Path, w: Workspace, manifests: list[str]) -> None:
             w.note("no main package", src)
         return
 
+    # A root that declares members is a container in EVERY ecosystem, not
+    # just Node. Airflow's root pyproject declares a uv workspace and was
+    # still adjudicated as an application, so the repository reported its own
+    # root as deployable alongside 121 members.
+    if w.is_root and w.members:
+        w.role = "workspace-root"
+        w.rejected_because = (f"declares {len(w.members)} member(s); an "
+                              f"aggregator, not an application of its own")
+        w.note(f"workspace root over {len(w.members)} member(s)", w.path or ".")
+        return
+
     if "pom.xml" in manifests or "build.gradle" in manifests \
             or "build.gradle.kts" in manifests:
-        if w.is_root and w.members:
-            w.role = "workspace-root"
-            w.rejected_because = "reactor/aggregator module with no application of its own"
-            return
         w.role, w.runnable = "service", True
+        w.weak = True
         w.note("JVM module planned on its own", w.path or ".")
+        return
+
+    if "manage.py" in manifests:
+        w.role, w.runnable = "service", True
+        w.language, w.build_system = "python", "django"
+        w.note("Django project: manage.py declares the application root",
+               f"{w.path}/manage.py".lstrip("./"))
         return
 
     if "pyproject.toml" in manifests or "setup.py" in manifests \
             or "requirements.txt" in manifests:
         w.role, w.runnable = "application", True
+        w.weak = True
         w.note("python project planned on its own", w.path or ".")
         return
 
@@ -481,6 +505,54 @@ def _classify(root: Path, w: Workspace, manifests: list[str]) -> None:
     w.role = "unknown"
     w.status = "ambiguous"
     w.rejected_because = "no manifest identified a build or run mechanism"
+
+
+def _classify(root: Path, w: Workspace, manifests: list[str]) -> None:
+    """Try every manifest present, not just the first one found.
+
+    gitea ships go.mod AND package.json -- the Go service plus the npm build
+    for its frontend assets. Short-circuiting on package.json classified the
+    whole repository as a library and never reached the Go branch, where
+    main.go sits at the module root. "Never silently choose the first
+    manifest" is the requirement; this is where it is honoured.
+
+    A manifest that yields a runnable answer wins. If none does, the first
+    rejection is kept, and every ecosystem's reasoning is recorded so the
+    disagreement is visible.
+    """
+    order = sorted(manifests, key=lambda m: _MANIFEST_ORDER.get(m, 50))
+    first_rejection = None
+    for m in order:
+        probe = Workspace(path=w.path, manifests=w.manifests,
+                          is_root=w.is_root, members=w.members,
+                          declared_by=w.declared_by, language=w.language,
+                          build_system=w.build_system)
+        _classify_one(root, probe, [m])
+        w.reasons.extend(probe.reasons)
+        if probe.runnable:
+            w.role, w.runnable, w.weak = probe.role, True, probe.weak
+            w.status = probe.status if probe.status != "ok" else w.status
+            if probe.language:
+                w.language, w.build_system = probe.language, probe.build_system
+            return
+        if first_rejection is None and probe.rejected_because:
+            first_rejection = (probe.role, probe.rejected_because, probe.status)
+    if first_rejection:
+        w.role, w.rejected_because, w.status = first_rejection
+    else:
+        _classify_one(root, w, manifests)
+
+
+# Cheapest and most decisive first: a structural rejection (examples/, a
+# workspace root) short-circuits everything, and a compiled-language manifest
+# is a stronger statement about what a directory IS than package.json, which
+# is often only present to build assets.
+_MANIFEST_ORDER = {
+    "go.mod": 10, "Cargo.toml": 11, "pom.xml": 12, "build.gradle": 13,
+    "build.gradle.kts": 13, "manage.py": 14, "mix.exs": 15,
+    "package.json": 30, "pyproject.toml": 31, "setup.py": 32,
+    "requirements.txt": 33, "Gemfile": 34, "composer.json": 35,
+}
 
 
 def _go_mains(base: Path, limit: int = 400) -> list[str]:
@@ -574,9 +646,11 @@ def resolve_roles(graph: RepoGraph, limit: int = 40) -> None:
     from .planner import plan as make_plan
 
     root = Path(graph.root)
-    weak = [w for w in graph.workspaces
-            if w.runnable and w.role in _WEAK_ROLES
-            and "package.json" not in w.manifests]
+    # Keyed on HOW the role was decided, not on which files happen to exist.
+    # The previous test skipped anything with a package.json, so django --
+    # which ships one for its JS tooling -- escaped adjudication entirely and
+    # the framework reported itself as a deployable application.
+    weak = [w for w in graph.workspaces if w.runnable and w.weak]
     if len(weak) > limit:
         graph.notes.append(
             f"{len(weak)} candidates needed planner adjudication; only the "

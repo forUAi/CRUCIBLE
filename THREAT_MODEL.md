@@ -8,8 +8,14 @@ or is marked `UNVERIFIED`. `security/tm_check.py` fails if a claim names a
 test that does not exist, so this file cannot drift into fiction quietly.
 
 ```bash
-python3 security/tm_check.py          # every claim maps to a real test
+python3 security/tm_check.py                       # references resolve
+python3 security/tm_check.py --results release.json  # ...and actually ran
 ```
+
+`EVIDENCE:` names the code. `ASSERTS:` names the suite and the specific
+assertion inside it that must have **executed and passed**, in a recorded
+release run, against a named artifact hash. A file that exists is not
+evidence that anything ran; `--results` is the difference between the two.
 
 ---
 
@@ -79,52 +85,63 @@ They are different policies and must not be conflated.
 ### C1 — Repository code never executes on the host
 Every command runs under `unshare` inside the guest.
 EVIDENCE: `security/contain.py`
+ASSERTS: adversarial-python::host_clean
 
 ### C2 — A repository cannot reach host storage
 Even when the operator points CRUCIBLE at a path on a host-shared mount, the
 source is copied to guest-local storage before it becomes an overlay lower.
 EVIDENCE: `tests/test_planning.py::TestContainmentStaging`, `crucible/containment.py`, `security/contain.py`
+ASSERTS: unit::TestContainmentStaging
 
 ### C3 — Writes outside the workspace stay inside the box
 Writing `/etc` or `/root` succeeds and lands in the overlay upper, which dies
 with the box. That is containment working, not an escape.
 EVIDENCE: `security/contain.py`, `security/fixtures/hostile-python`
+ASSERTS: adversarial-python::escape_workspace_write
 
 ### C4 — Runtime egress is impossible
 EVIDENCE: `security/fixtures/hostile-python/app.py`, `security/contain.py`
+ASSERTS: adversarial-node::runtime_egress
 
 ### C5 — A repository cannot exhaust the shared store
 Per-sandbox ext4 project quota, enforced by the kernel, with
 `CAP_SYS_RESOURCE` dropped so uid 0 cannot bypass it.
 EVIDENCE: `security/fixtures/disk-bomb`, `crucible/diskbudget.py`
+ASSERTS: execution::disk-budget
 
 ### C6 — A repository cannot silence its own diagnosis
 Step logs live outside the quota'd tree, so exhausting the budget does not
 prevent recording why.
 EVIDENCE: `crucible/backends/namespace.py`, `security/fixtures/disk-bomb/fill.py`
+ASSERTS: execution::disk-budget
 
 ### C7 — A killed engine leaks nothing permanently
 Ownership is recorded as cgroup membership plus a registry stamped with the
 owner's pid and start time; a later run reclaims what a crashed one left.
 EVIDENCE: `security/lifecycle_test.py`, `crucible/lifecycle.py`
+ASSERTS: lifecycle::sigkill_pod
 
 ### C8 — Cleanup never touches anything that is not ours
 `cgroup.kill` cannot reach a non-member; the registry's start-time stamp
 prevents acting on a recycled pid.
 EVIDENCE: `security/lifecycle_test.py`, `crucible/lifecycle.py`
+ASSERTS: lifecycle::bystander
 
 ### C9 — A build step cannot run forever
 The deadline is enforced independently of output, and the supervisor reads a
 file rather than a pipe a descendant can hold open.
 EVIDENCE: `tests/test_backend_contract.py`, `crucible/backends/namespace.py`
+ASSERTS: unit::TestBackendContract
 
 ### C10 — Evidence cannot be forged by malformed output
 Probe output is ANSI-stripped and JSON-parsed; unparseable output yields
 `INCONCLUSIVE`, never `PASS`.
 EVIDENCE: `security/contain.py`
+ASSERTS: adversarial-node::malformed_output
 
 ### C11 — No host secrets are present in the sandbox
 EVIDENCE: `security/fixtures/hostile-python/probe.py`, `security/contain.py`
+ASSERTS: adversarial-java::credentials
 
 ### C12 — Build-time egress is restricted
 **UNVERIFIED — and currently false.** Build network is unrestricted and only

@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -55,7 +56,24 @@ def sh(cmd: str, timeout: int = 900) -> subprocess.CompletedProcess:
                           timeout=timeout)
 
 
+IN_GUEST = shutil.which("limactl") is None
+
+
 def guest(script: str, timeout: int = 900) -> subprocess.CompletedProcess:
+    """Run in the sandbox host.
+
+    From a developer Mac that means driving the Lima guest. From inside the
+    guest -- which is where the release gate runs it -- there is no limactl
+    and the commands are simply local. The previous version always shelled
+    out through limactl and failed in 0.0s under the release gate, reporting
+    INCONCLUSIVE: the right verdict for the wrong reason.
+
+    The distinction matters for what the integrity check MEANS, and is
+    reported rather than glossed: from the Mac it is host integrity; from
+    inside the guest it is guest integrity, which is a weaker claim.
+    """
+    if IN_GUEST:
+        return sh(script, timeout)
     return sh(f"limactl shell {VM} -- bash -lc {json.dumps(script)}", timeout)
 
 
@@ -74,7 +92,8 @@ def host_snapshot() -> dict:
                 p.read_bytes()).hexdigest()[:16]
         except OSError:
             files[str(p.relative_to(HOST_REPO))] = "unreadable"
-    listeners = sh("lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk '{print $9}' "
+    listeners = sh("(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null || "
+                   "ss -ltnH 2>/dev/null) | awk '{print $9" "$4}' "
                    "| sort -u").stdout.strip().splitlines()
     return {
         "files": files,
@@ -263,6 +282,11 @@ def main() -> int:
     if a.run not in fixtures:
         sys.exit(f"unknown fixture {a.run}; have {fixtures}")
 
+    scope = "guest" if IN_GUEST else "host"
+    print(f"── integrity scope: {scope}"
+          + ("  (running inside the VM: this proves the sandbox did not escape "
+             "into the guest, which is weaker than proving it did not reach "
+             "the host)" if IN_GUEST else ""))
     results = []
     for i in range(a.repeat):
         print(f"── {a.run} run {i + 1}/{a.repeat}")
