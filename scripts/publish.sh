@@ -65,6 +65,13 @@ trap cleanup EXIT
 export GIT_ASKPASS="$ASKPASS"
 export GIT_TERMINAL_PROMPT=0
 
+# Disable every credential helper for these invocations. On macOS git uses
+# osxkeychain by default, and a stored github.com credential is consulted
+# BEFORE GIT_ASKPASS -- so the token in .env was ignored and the push was
+# attempted as whichever account the keychain happened to hold. The error
+# ("denied to <other-account>") names that account, not the token's.
+GIT_NOCRED=(-c credential.helper= -c credential."https://github.com".helper=)
+
 REMOTE_URL="https://github.com/${GITHUB_REPO}.git"
 
 echo "repository : ${GITHUB_REPO}"
@@ -75,25 +82,39 @@ echo
 
 # ------------------------------------------------------------ access check
 echo "checking write access..."
-if ! git ls-remote "$REMOTE_URL" >/dev/null 2>&1; then
+if ! git "${GIT_NOCRED[@]}" ls-remote "$REMOTE_URL" >/dev/null 2>&1; then
   echo "  cannot read ${GITHUB_REPO}: check the token and the repository name." >&2
   exit 1
 fi
 
-# A no-op push to an unused ref is the cheapest honest write test.
-if git push --dry-run "$REMOTE_URL" "HEAD:refs/heads/${GITHUB_BRANCH}" >/dev/null 2>&1; then
-  echo "  write access confirmed"
-else
-  echo "  WRITE DENIED. The token authenticates, but its account has no push" >&2
-  echo "  permission on ${GITHUB_REPO}." >&2
-  echo "  Use a token from an account that owns or collaborates on that repo." >&2
+# A dry-run push is the cheapest honest write test. Its output is KEPT: the
+# first version of this script sent it to /dev/null and reported every failure
+# as "write denied", which misdiagnosed a credential-helper collision as a
+# permissions problem. A check that discards the evidence it is checking is
+# worse than no check.
+if ! PUSH_ERR="$(git "${GIT_NOCRED[@]}" push --dry-run "$REMOTE_URL" \
+                     "HEAD:refs/heads/${GITHUB_BRANCH}" 2>&1)"; then
+  echo "  push refused. git said:" >&2
+  echo "$PUSH_ERR" | sed 's/^/    /' >&2
+  case "$PUSH_ERR" in
+    *"denied to"*)
+      echo >&2
+      echo "  If the account named above is not the one that owns your token," >&2
+      echo "  a credential helper overrode it. This script disables them; a" >&2
+      echo "  manual push needs: git -c credential.helper= push ..." >&2 ;;
+    *"non-fast-forward"*|*"fetch first"*)
+      echo >&2
+      echo "  The remote moved. Merge it -- never force-push:" >&2
+      echo "    git fetch origin && git merge origin/${GITHUB_BRANCH}" >&2 ;;
+  esac
   exit 1
 fi
+echo "  write access confirmed"
 
 if [[ $DRY_RUN -eq 1 ]]; then
   echo
   echo "dry run: would push ${GITHUB_BRANCH} and tag v0.1.0, then create the release."
-  git push --dry-run "$REMOTE_URL" "HEAD:refs/heads/${GITHUB_BRANCH}" 2>&1 | sed 's/^/    /'
+  echo "$PUSH_ERR" | sed 's/^/    /'
   exit 0
 fi
 
@@ -102,10 +123,10 @@ fi
 # merging, never by overwriting.
 echo
 echo "pushing ${GITHUB_BRANCH}..."
-git push "$REMOTE_URL" "HEAD:refs/heads/${GITHUB_BRANCH}"
+git "${GIT_NOCRED[@]}" push "$REMOTE_URL" "HEAD:refs/heads/${GITHUB_BRANCH}"
 
 echo "pushing tag v0.1.0..."
-git push "$REMOTE_URL" v0.1.0
+git "${GIT_NOCRED[@]}" push "$REMOTE_URL" v0.1.0
 
 # ---------------------------------------------------------------- release
 ASSETS_DIR="${ASSETS_DIR:-/tmp/release-assets}"
