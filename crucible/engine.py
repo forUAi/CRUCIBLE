@@ -144,7 +144,7 @@ class Engine:
                  store_mb: Optional[int] = None,
                  step_timeout: Optional[int] = None,
                  verbose: bool = False, disk_mb: int = 4096,
-                 policy=None):
+                 policy=None, cpu_pct: int = 100):
         self.backend_cls = backend_cls
         self.budget = budget
         self.llm = llm
@@ -160,6 +160,7 @@ class Engine:
         # A default budget, not an opt-in. An untrusted repository with no
         # ceiling can fill the store and take every other job with it.
         self.disk_mb = disk_mb
+        self.cpu_pct = cpu_pct
         from .netpolicy import DEFAULT
         self.policy = policy or DEFAULT
 
@@ -248,7 +249,8 @@ class Engine:
             self.log(f"  ! reaper: {e}")
         box = self.backend_cls(f"box-{uuid.uuid4().hex[:8]}", log=self.log, mem_mb=self.mem_mb,
                                store_mb=self.store_mb,
-                               disk_mb=self.disk_mb)
+                               disk_mb=self.disk_mb,
+                               cpu_pct=self.cpu_pct)
         box.policy = self.policy
         box.dns = dns
 
@@ -291,7 +293,8 @@ class Engine:
                         box = self.backend_cls(f"box-{uuid.uuid4().hex[:8]}",
                                                log=self.log, mem_mb=self.mem_mb,
                                                store_mb=self.store_mb,
-                                               disk_mb=self.disk_mb)
+                                               disk_mb=self.disk_mb,
+                               cpu_pct=self.cpu_pct)
                         box.policy = self.policy
                         box.dns = dns
                     box.up(plan.base, repo, plan.system_packages)

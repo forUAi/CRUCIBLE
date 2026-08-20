@@ -74,6 +74,8 @@ def main(argv=None) -> int:
     ap.add_argument("--step-timeout", type=int, default=None,
                     help="cap every step's wall clock (seconds); the plan's own "
                          "timeouts still apply when lower")
+    ap.add_argument("--cpu-pct", type=int, default=100,
+                    help="CPU quota as a percentage of one core (cgroup cpu.max)")
     ap.add_argument("--disk-mb", type=int, default=4096,
                     help="per-sandbox writable storage budget in MB (0 = none)")
     ap.add_argument("--store-mb", type=int, default=None,
@@ -149,7 +151,7 @@ def main(argv=None) -> int:
                  use_cache=not a.no_cache, llm=None if a.no_llm else _llm_from_env(),
                  base_override=a.base, store_mb=a.store_mb,
                  step_timeout=a.step_timeout, verbose=a.verbose,
-                 disk_mb=a.disk_mb)
+                 disk_mb=a.disk_mb, cpu_pct=a.cpu_pct)
 
     out = eng.run(repo, prefer=a.prefer)
 
