@@ -596,6 +596,20 @@ JVM_SERVICE_PATTERNS = [
 ]
 
 
+def _jdk_release(val: str) -> str:
+    """`1.8` -> `8`, `17` -> `17`.
+
+    Legacy JDK version strings carry a `1.` prefix; modern ones do not. This
+    was `val.lstrip("1.")`, which strips a *character set*: 17 became 7, and
+    11 became the empty string. Petclinic pinned java.version=17 and got
+    `eclipse-temurin:7-jdk`, a tag that does not exist.
+    """
+    val = val.strip()
+    if val.startswith("1.") and len(val) > 2:
+        return val[2:]
+    return val
+
+
 def _strip_ns(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
@@ -700,7 +714,7 @@ def _parse_jvm(root: Path, ev: Evidence) -> None:
                     name, val = _strip_ns(c.tag), (c.text or "").strip()
                     if name in ("java.version", "maven.compiler.release",
                                 "maven.compiler.source", "kotlin.jvm.target") and val:
-                        add(Signal("runtime", f"java:{val.lstrip('1.')}", 0.97, rel))
+                        add(Signal("runtime", f"java:{_jdk_release(val)}", 0.97, rel))
 
         parent = kids.get("parent")
         if parent is not None:

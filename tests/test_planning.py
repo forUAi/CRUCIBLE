@@ -365,3 +365,62 @@ class TestLintCatchesTheOriginalBug(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestJdkReleaseParsing(unittest.TestCase):
+    """`lstrip` takes a character set, not a prefix. 17 -> 7, 11 -> ''."""
+
+    def test_modern_and_legacy_versions(self):
+        from crucible.evidence import _jdk_release
+        for raw, want in (("17", "17"), ("11", "11"), ("21", "21"),
+                          ("1.8", "8"), ("8", "8"), (" 17 ", "17")):
+            with self.subTest(raw=raw):
+                self.assertEqual(want, _jdk_release(raw))
+
+    def test_pom_java_version_reaches_the_base_image(self):
+        import tempfile
+        for ver, want in (("17", "17"), ("11", "11"), ("1.8", "8")):
+            with self.subTest(ver=ver), tempfile.TemporaryDirectory() as d:
+                t = Path(d)
+                (t / "pom.xml").write_text(
+                    '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+                    '<modelVersion>4.0.0</modelVersion>'
+                    '<groupId>x</groupId><artifactId>svc</artifactId>'
+                    '<version>1.0</version>'
+                    f'<properties><java.version>{ver}</java.version></properties>'
+                    '</project>')
+                (t / "App.java").write_text("class App {}")
+                ev = collect(str(t))
+                p = make_plan(ev)
+                self.assertEqual(f"eclipse-temurin:{want}-jdk", p.base)
+
+
+class TestStatedPortLeads(unittest.TestCase):
+    """The oracle probes ports[0]; a grepped 80 must not outrank 8080."""
+
+    def test_framework_port_outranks_an_incidental_low_port(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d)
+            (t / "src/main/resources").mkdir(parents=True)
+            (t / "pom.xml").write_text(
+                '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+                '<modelVersion>4.0.0</modelVersion>'
+                '<parent><groupId>org.springframework.boot</groupId>'
+                '<artifactId>spring-boot-starter-parent</artifactId>'
+                '<version>3.3.2</version></parent>'
+                '<groupId>x</groupId><artifactId>svc</artifactId><version>1.0</version>'
+                '<properties><java.version>17</java.version></properties>'
+                '<dependencies><dependency>'
+                '<groupId>org.springframework.boot</groupId>'
+                '<artifactId>spring-boot-starter-web</artifactId>'
+                '</dependency></dependencies></project>')
+            # a docs URL containing :80, exactly how petclinic acquired it
+            (t / "README.md").write_text("visit http://example.com:80/ for docs\n")
+            (t / "src/main/resources/application.properties").write_text("")
+            (t / "App.java").write_text("class App {}")
+            ev = collect(str(t))
+            p = make_plan(ev)
+            self.assertEqual(8080, p.ports[0])
+            self.assertEqual(8080, p.oracle.get("port"))
+            self.assertEqual("8080", p.env.get("PORT"))

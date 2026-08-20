@@ -479,7 +479,12 @@ def _infer(ev: Evidence) -> RunPlan:
     # --- archetype + run ---
     arch, port, run = _pick_run(ev, lang, pm, fw)
     p.archetype, p.run = arch, run
-    p.ports = sorted({port, *_app_ports(ev)} - {0}) if port else _app_ports(ev)
+    # Order matters: ports[0] is what the oracle probes and what PORT
+    # exports. Sorting numerically made petclinic pick 80 -- a number the
+    # corpus grep found in a URL -- over the 8080 its framework declares.
+    # The stated port leads; the rest follow for EXPOSE.
+    others = [x for x in _app_ports(ev) if x != port]
+    p.ports = ([port] if port else []) + sorted(others)
     p.note(f"archetype={arch} via {'framework ' + fw if fw else 'entrypoint heuristics'}")
 
     for k in ev.env_keys:
