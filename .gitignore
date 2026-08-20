@@ -7,3 +7,6 @@ dist/
 out/
 crucible.lock.json
 dist/
+evidence/**/*.tar.gz
+*.img
+.lima/

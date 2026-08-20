@@ -125,7 +125,7 @@ def resolve(path: str) -> Path:
     if user:
         try:
             # Ask the password database. Guessing /home/<user> is wrong here:
-            # this guest's home is /home/vishalchandupatla.guest.
+            # a Lima guest home is not always /home/<user>.
             return Path(pwd.getpwnam(user).pw_dir) / path.lstrip("~/")
         except KeyError:
             pass

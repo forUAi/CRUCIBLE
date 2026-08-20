@@ -29,7 +29,7 @@ The system Python is 3.9; this needs 3.11+. A venv on Homebrew's 3.13 is at
 `.venv/`:
 
 ```bash
-/Users/vishalchandupatla/Projects/crucible/.venv/bin/crucible ./some-repo --plan-only
+.venv/bin/crucible ./some-repo --plan-only
 ```
 
 Or without the venv, from the project root:
