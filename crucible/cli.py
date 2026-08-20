@@ -74,6 +74,11 @@ def main(argv=None) -> int:
     ap.add_argument("--step-timeout", type=int, default=None,
                     help="cap every step's wall clock (seconds); the plan's own "
                          "timeouts still apply when lower")
+    ap.add_argument("--preflight", action="store_true",
+                    help="report the containment capability roster and exit")
+    ap.add_argument("--waive-capability", action="append", default=[],
+                    metavar="NAME",
+                    help="run without a mandatory capability, named explicitly")
     ap.add_argument("--cpu-pct", type=int, default=100,
                     help="CPU quota as a percentage of one core (cgroup cpu.max)")
     ap.add_argument("--disk-mb", type=int, default=4096,
@@ -105,6 +110,13 @@ def main(argv=None) -> int:
     repo = _clone(a.target) if a.target.startswith(("http://", "https://", "git@")) else a.target
     if not Path(repo).is_dir():
         sys.exit(f"not a directory: {repo}")
+
+    from . import preflight
+    if a.preflight:
+        print("\n\033[1m▸ containment capabilities\033[0m")
+        blocking = preflight.report(preflight.check())
+        print(f"\n{blocking} mandatory capability(ies) missing")
+        return 1 if blocking else 0
 
     if a.workspaces:
         return _print_workspaces(repo, a)
@@ -145,6 +157,10 @@ def main(argv=None) -> int:
     except netpolicy.PolicyError as e:
         sys.exit(f"network policy: {e}")
     print(f"\n\033[1m▸ network policy\033[0m  {policy.describe()}")
+
+    # Before anything is built. A capability discovered missing mid-run is a
+    # property already claimed and not held.
+    preflight.enforce(waive=tuple(a.waive_capability))
 
     eng = Engine(policy=policy, budget=a.budget, mem_mb=a.mem,
                  run_offline=not a.online_run,

@@ -37,6 +37,8 @@ from pathlib import Path
 
 # Each suite: (name, argv, needs_root, why it is in a release gate)
 SUITES = [
+    ("preflight", [sys.executable, "-m", "crucible.cli", "--preflight", "."],
+     True, "every containment capability is present before anything runs"),
     ("unit", [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
      False, "the analysis half, and every structural contract"),
     ("threat-model", [sys.executable, "security/tm_check.py"],

@@ -124,3 +124,47 @@ class TestOwnershipBoundaryShipped(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPreflightRefuses(unittest.TestCase):
+    """A missing containment capability must block, not warn.
+
+    On a host without setquota the sandbox still builds, still runs and still
+    reports SUCCESS while the disk budget is unenforced. The budget reports
+    itself UNAVAILABLE, but by then the run is underway and the line is one
+    among hundreds.
+    """
+
+    def test_every_mandatory_capability_names_what_it_protects(self):
+        from crucible import preflight
+        for cap in preflight.check():
+            with self.subTest(cap=cap.name):
+                self.assertTrue(cap.protects,
+                                f"{cap.name} must say what it protects")
+
+    def test_a_missing_mandatory_capability_raises(self):
+        from crucible import preflight
+        from unittest import mock
+        fake = [preflight.Capability("project quota stack", False, True,
+                                     "missing: setquota", "disk budgets")]
+        with mock.patch.object(preflight, "check", lambda: fake):
+            with self.assertRaises(SystemExit) as cm:
+                preflight.enforce(log=lambda *_: None)
+            self.assertIn("project quota stack", str(cm.exception))
+
+    def test_a_waiver_must_be_named_explicitly(self):
+        from crucible import preflight
+        from unittest import mock
+        fake = [preflight.Capability("project quota stack", False, True,
+                                     "missing", "disk budgets")]
+        with mock.patch.object(preflight, "check", lambda: fake):
+            preflight.enforce(log=lambda *_: None,
+                              waive=("project quota stack",))
+
+    def test_a_degraded_optional_capability_does_not_block(self):
+        from crucible import preflight
+        from unittest import mock
+        fake = [preflight.Capability("cgroup.kill", False, False,
+                                     "kernel < 5.14", "exact termination")]
+        with mock.patch.object(preflight, "check", lambda: fake):
+            preflight.enforce(log=lambda *_: None)
