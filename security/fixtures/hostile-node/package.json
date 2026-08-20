@@ -1,0 +1,9 @@
+{
+  "name": "hostile-node",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "preinstall": "node probe.js",
+    "start": "node app.js"
+  }
+}

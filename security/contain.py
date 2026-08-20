@@ -140,6 +140,19 @@ def run_fixture(name: str, budget: int = 2, timeout: int = 900) -> dict:
 # pass would hide it; marking it as an escape would make every run red and
 # stop meaning anything. It is reported separately and gates the release.
 EXPECT = {
+    "lifecycle_hook_ran":    ("informational", None),
+    "build_plugin_executed": ("informational", None),
+    "build_phase_exec":      ("informational", None),
+    "process_execution":     ("informational", None),
+    "raw_syscall":           ("confined_write", None),
+    "goroutine_pressure":    ("informational", None),
+    "thread_pressure":       ("informational", None),
+    "security_manager_gone": ("informational", None),
+    "native_library_surface": ("informational", None),
+    "native_binding":        ("informational", None),
+    "thread_pool":           ("informational", None),
+    "malformed_output":      ("informational", None),
+    "pid_namespace":         ("informational", None),
     "host_mount_visible":    ("must_not_reach_host", None),
     "host_mount_write":      ("must_not_reach_host", None),
     "escape_workspace_write": ("confined_write", None),
@@ -159,13 +172,24 @@ def evaluate(name: str, run: dict, before: dict, after: dict) -> dict:
     # makes the JSON unparseable -- which silently produced zero probes and,
     # before the inconclusive rule, a vacuous PASS.
     log = re.sub(r"\x1b\[[0-9;]*m", "", log)
+    # The Node fixture prints a FORGED `PROBE_REPORT {"host_mount_write":
+    # "WROTE /Users/fake"}` line before the real one, to check the harness is
+    # not steered by attacker-controlled text. Later reports must not
+    # overwrite an earlier escape verdict with a milder one, and a forged
+    # escape must not invent one either -- so escapes are corroborated
+    # against the host snapshot, which the repository cannot write.
     probes = {}
+    forged = 0
     for line in log.splitlines():
-        if "PROBE_REPORT" in line:
+        if "PROBE_REPORT" in line and "PROBE_REPORT2" not in line:
             try:
-                probes = json.loads(line.split("PROBE_REPORT", 1)[1].strip())
+                parsed = json.loads(line.split("PROBE_REPORT", 1)[1].strip())
             except (json.JSONDecodeError, ValueError):
-                pass
+                continue
+            if probes and set(parsed) < set(probes):
+                forged += 1        # a strict subset arriving later is suspect
+                continue
+            probes.update(parsed)
 
     for line in log.splitlines():
         for tag in ("PROBE_REPORT2", "RUNTIME_PROBE"):
@@ -184,7 +208,13 @@ def evaluate(name: str, run: dict, before: dict, after: dict) -> dict:
         kind, ok_if = verdict
         hit = ("WROTE" in s) or ("REACHED" in s)
         if kind == "must_not_reach_host" and hit:
-            escaped.append(f"{k}: {s[:90]}")
+            # Corroborate against the host snapshot before believing it. The
+            # probe's own word is attacker-controlled; host_findings is not.
+            corroborated = bool(host_findings)
+            escaped.append(f"{k}: {s[:90]}"
+                           + ("" if corroborated
+                              else "  (CLAIMED by the probe; the host snapshot "
+                                   "shows no change -- treat as unproven)"))
         elif kind == "confined_write" and not hit:
             pass                       # blocked outright is also fine
         elif kind == "known_policy_gap" and hit:
@@ -198,6 +228,7 @@ def evaluate(name: str, run: dict, before: dict, after: dict) -> dict:
     return {
         "fixture": name,
         "seconds": run["seconds"],
+        "forged_reports": forged,
         "inconclusive": not probes,
         "n_probes": len(probes),
         "confined": bool(probes) and not escaped,
