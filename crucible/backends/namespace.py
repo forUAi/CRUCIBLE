@@ -58,6 +58,8 @@ _STORE_READY = False
 # preexec_fn runs in the forked child and cannot close over self; a one-slot
 # module global carries the per-sandbox file-size ceiling across the fork.
 _FSIZE_MB = [0]
+# Same trick, same reason: the child must join its cgroup itself, before exec.
+_CGROUP = [""]
 
 
 def _ram_mb() -> int:
@@ -241,6 +243,7 @@ class NamespaceBackend(SandboxBackend):
         self.budget = apply_budget(self.dir, self.id, self.disk_mb,
                                    STATE_ROOT, self.log)
         _FSIZE_MB[0] = self.disk_mb
+        _CGROUP[0] = self.cgroup
         if self.disk_mb and not self.budget.enforced:
             self.log(f"  \033[33m! disk budget UNENFORCED: "
                      f"{self.budget.reason}\033[0m")
@@ -690,9 +693,36 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         libc.prctl(PR_CAPBSET_DROP, CAP_SYS_RESOURCE, 0, 0, 0)
 
     @staticmethod
+    def _join_cgroup() -> None:
+        """Enter the run's cgroup in the forked child, before exec.
+
+        Attaching the parent *after* Popen is too late and was silently
+        useless. `unshare --fork` forks its pid-namespace child immediately,
+        so by the time the supervisor wrote the unshare pid into
+        cgroup.procs, the child -- and everything it would go on to spawn --
+        had already been created in the root cgroup.
+
+        Measured: pids.max was 512 and pids.current peaked at 1, while a Java
+        fixture inside that sandbox started 2000 OS threads and a Go fixture
+        ran 20000 goroutines, neither of them counted and neither capped. The
+        memory and cpu limits were equally decorative.
+
+        Writing our own pid here, in the child, means every descendant
+        inherits membership.
+        """
+        if not _CGROUP[0]:
+            return
+        try:
+            with open(f"/sys/fs/cgroup/{_CGROUP[0]}/cgroup.procs", "w") as fh:
+                fh.write(str(os.getpid()))
+        except OSError:
+            pass          # reported by the supervisor, which can still see it
+
+    @staticmethod
     def _child_limits() -> None:
         import resource
         os.setsid()
+        NamespaceBackend._join_cgroup()
         NamespaceBackend._drop_cap_sys_resource()
         try:
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -740,6 +770,18 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
             pass
         if not self._cg:
             self.log("  ! cgroups unavailable -- rlimits only")
+            return
+        g = self._cg[0]
+        applied = []
+        for f, want in (("pids.max", str(self.pid_max)),
+                        ("memory.max", str(self.mem_mb * 1024 * 1024))):
+            got = (g / f).read_text().strip() if (g / f).exists() else "<absent>"
+            applied.append(f"{f}={got}")
+            if got != want:
+                # A limit that did not take is worse than no limit, because it
+                # looks like one.
+                self.log(f"  \033[33m! {f} is {got}, wanted {want}\033[0m")
+        self.log(f"  limits: {', '.join(applied)}")
 
     def _cgroup_attach(self, pid: int) -> None:
         for g in self._cg:
