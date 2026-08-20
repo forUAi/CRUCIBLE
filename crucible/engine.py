@@ -69,6 +69,7 @@ class Outcome:
     elapsed: float = 0.0
     cache_hit: bool = False
     steps_skipped: int = 0
+    exhausted: bool = False     # ran out of a sandbox resource, not a repo defect
 
 
 _MANIFESTS = (
@@ -138,7 +139,8 @@ class Engine:
     def __init__(self, backend_cls=NamespaceBackend, budget: int = 6,
                  llm: Optional[Callable] = None, log=print, mem_mb: int = 2048,
                  run_offline: bool = True, use_cache: bool = True,
-                 base_override: Optional[str] = None):
+                 base_override: Optional[str] = None,
+                 store_mb: Optional[int] = None):
         self.backend_cls = backend_cls
         self.budget = budget
         self.llm = llm
@@ -147,6 +149,8 @@ class Engine:
         self.run_offline = run_offline
         self.use_cache = use_cache
         self.base_override = base_override
+        from .backends.namespace import default_store_mb
+        self.store_mb = store_mb or default_store_mb()
 
     # ------------------------------------------------------------------
 
@@ -179,7 +183,15 @@ class Engine:
 
         plan, cache_hit = self._seed_plan(ev, efp, prefer)
         self._lint(plan, ev)
-        box = self.backend_cls(f"box-{uuid.uuid4().hex[:8]}", log=self.log, mem_mb=self.mem_mb)
+
+        # Cleanup after a crash cannot be the crashing process's job.
+        from .backends.namespace import reap_abandoned
+        try:
+            reap_abandoned(self.log)
+        except OSError as e:
+            self.log(f"  ! reaper: {e}")
+        box = self.backend_cls(f"box-{uuid.uuid4().hex[:8]}", log=self.log, mem_mb=self.mem_mb,
+                               store_mb=self.store_mb)
         box.dns = dns
 
         out = Outcome(False, plan, efp, cache_hit=cache_hit)
@@ -204,9 +216,10 @@ class Engine:
                 if plan.base != current_base:
                     if current_base is not None:
                         self.log("  rebase -> rebuilding rootfs")
-                        box.down()
+                        box.destroy()
                         box = self.backend_cls(f"box-{uuid.uuid4().hex[:8]}",
-                                               log=self.log, mem_mb=self.mem_mb)
+                                               log=self.log, mem_mb=self.mem_mb,
+                                               store_mb=self.store_mb)
                         box.dns = dns
                     box.up(plan.base, repo, plan.system_packages)
                     current_base = plan.base
@@ -269,8 +282,20 @@ class Engine:
                 patch.apply(plan)
                 plan.generation += 1
                 plan.note(f"gen{plan.generation}: {patch.reason}")
+        except OSError as e:
+            # Resource exhaustion is a classified outcome, not a traceback.
+            # ENOSPC in the layer store crashed the run with a raw stack after
+            # a 76-second Maven build had already succeeded.
+            import errno
+            if e.errno not in (errno.ENOSPC, errno.EDQUOT, errno.EMFILE, errno.ENFILE):
+                raise
+            name = errno.errorcode.get(e.errno, str(e.errno))
+            out.detail = (f"sandbox resource exhausted ({name}): {e}. "
+                          f"The layer store is capped; raise it with --store-mb.")
+            out.exhausted = True
+            self.log(f"\033[31m  ✗ {out.detail}\033[0m")
         finally:
-            box.down()
+            box.destroy()
             dns.stop()
 
         out.ledger = Ledger(

@@ -56,6 +56,22 @@ def _sh(cmd: str, check: bool = False) -> subprocess.CompletedProcess:
 _STORE_READY = False
 
 
+def default_store_mb(floor: int = 4096, ceiling: int = 65536) -> int:
+    """Half the free space where the store will live, within bounds.
+
+    A fixed 4 GB is not a policy, it is a guess, and it is wrong in both
+    directions: too small for one JVM base plus a Maven cache plus a mysql
+    sidecar (that combination filled it and crashed the run with ENOSPC), and
+    wasteful on a laptop with little room. Ask the disk.
+    """
+    try:
+        st = os.statvfs(STATE_ROOT.parent if STATE_ROOT.parent.exists() else "/")
+        free_mb = (st.f_bavail * st.f_frsize) // (1024 * 1024)
+    except OSError:
+        return floor
+    return max(floor, min(ceiling, free_mb // 2))
+
+
 def ensure_private_store(size_mb: int = 4096, log=print) -> None:
     """Give the layer store its own filesystem. Non-negotiable, and subtle.
 
@@ -139,6 +155,7 @@ class NamespaceBackend(SandboxBackend):
 
     def up(self, base: str, repo_path: str, system_packages: list[str]) -> None:
         self.repo = Path(repo_path).resolve()
+        self._claim()
         for d in (self.layers_dir, self.merged):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -194,6 +211,53 @@ class NamespaceBackend(SandboxBackend):
     def destroy(self) -> None:
         self.down()
         shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _claim(self) -> None:
+        """Stamp this box with the pid that owns it, so a later run can tell
+        an abandoned box from one in use."""
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            (self.dir / "owner.pid").write_text(str(os.getpid()))
+        except OSError:
+            pass
+
+
+def reap_abandoned(log=print) -> int:
+    """Unmount and delete boxes whose owning process is gone.
+
+    A run that is killed -- timeout, SIGKILL, a crash inside the engine --
+    never reaches down(), so its overlay mounts stay live and its directory
+    stays on disk. Four such boxes had accumulated 674 MB and were still
+    holding overlay mounts, which is also what pinned the loop device the
+    store lives on. Cleanup after a crash cannot be the crashing process's
+    job; it has to happen on the way in.
+    """
+    if not STATE_ROOT.is_dir():
+        return 0
+    reaped = 0
+    for d in sorted(STATE_ROOT.glob("box-*")):
+        pid_file = d / "owner.pid"
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (OSError, ValueError):
+            pid = None
+        if pid is not None:
+            try:
+                os.kill(pid, 0)
+                continue                      # still running, leave it alone
+            except PermissionError:
+                continue                      # exists, owned by someone else
+            except ProcessLookupError:
+                pass
+        merged = d / "merged"
+        for target in (merged / "workspace", merged / "dev/shm", merged):
+            _sh(f"umount -l {target} 2>/dev/null")
+        shutil.rmtree(d, ignore_errors=True)
+        if not d.exists():
+            reaped += 1
+    if reaped:
+        log(f"  reaped {reaped} abandoned box(es) from earlier runs")
+    return reaped
 
     # ------------------------------------------------------------------
     # overlay plumbing
