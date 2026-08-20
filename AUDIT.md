@@ -381,7 +381,97 @@ only as the store size), cache-lifecycle policy, and sparse-image growth
 accounting. The 3.2 GB warm cache was **not** deleted to make any of this
 pass.
 
-## 9. Honest maturity label
+## 9. Workspace / monorepo planning
+
+```bash
+python3 -m crucible.cli <repo> --workspaces        # the graph, with provenance
+python3 bench/wsbench.py --split dev
+python3 bench/wsbench.py --split validation
+python3 bench/wsbench.py --split holdout --unlock  # refuses without the flag
+```
+
+A repository is now a graph of projects. Discovery is declaration-first;
+manifests no root claims are independent projects; each workspace gets a role
+recorded with the file and field that decided it; only deployable roles get a
+plan, and the plan comes from the existing evidence -> planner pipeline
+pointed at that subtree.
+
+### Corpus
+
+32 repositories, 8 per language band, pinned to exact SHAs, splits assigned
+by a hash of the slug so they cannot drift toward a better-looking number.
+Every band carries negative controls — a corpus of only deployable things
+cannot detect the failure mode where everything looks deployable.
+
+| Split | Repos | Composition |
+|---|---|---|
+| dev | 17 | python 6, go 5, java 4, node 2 |
+| validation | 9 | node 5, go 2, java 2 |
+| **holdout** | 6 | python 2, java 2, go 1, node 1 |
+
+### Results
+
+| Metric | dev | validation | holdout |
+|---|---|---|---|
+| repositories scored | 17/17 | 9/9 | 6/6 |
+| language | 100% | 100% | 100% |
+| root_runnable | 100% (14) | 100% (8) | **80% (4/5)** |
+| runnable count within bounds | 100% (7) | 100% (4) | 100% (3) |
+| must_include / must_exclude | 100% | 100% | 100% |
+| every decision explained | 100% | 100% | 100% |
+| crashes | 0 | 0 | 0 |
+
+45 checks on dev, 23 on validation and 15 on holdout were **unlabelled** and
+excluded from their denominators rather than being given a guessed label.
+
+The holdout was run **once**, after tuning stopped.
+
+### The one holdout failure
+
+`prometheus/prometheus`: labelled `root_runnable=False`, reported runnable.
+CRUCIBLE is self-consistent here — its documented Go rule is that a module's
+entry point is at the module root *or under `cmd/`*, and prometheus's binary
+is `cmd/prometheus`. My label contradicted my own stated convention. It is
+left failing rather than relabelled, because relabelling on holdout evidence
+is exactly the manoeuvre a holdout exists to prevent. A human should
+adjudicate whether "the root Go module builds a binary from cmd/" counts as a
+runnable root.
+
+Diagnosing it did surface a real defect: the evidence cited was
+`cmd/prometheus/reload_test.go`, a **test** file. `_test.go` is now excluded
+from entry-point detection. `cmd/prometheus/main.go` exists, so the holdout
+score is unchanged by that fix and the split is not contaminated.
+
+### What real repositories changed
+
+Each rule below replaced a previous rule that a real repository broke:
+
+| Repository | Before | After | Rule it forced |
+|---|---|---|---|
+| backstage | root a service, 193 deployable | root a container, 22 | a root declaring members is a container; a published `main` with no `bin` is consumed, not deployed |
+| grpc-go | 5 deployable | 1 (its one real binary) | Go entry points live at the module root or `cmd/`; the walk stops at nested `go.mod` |
+| turborepo | — | 13 across node+rust | pnpm member globs with negation (`!packages/turbo`) |
+| flask, express, requests, gin, axum, nest, vuejs/core | — | 0 at the root | weak structural roles are adjudicated by the real planner, not a second copy of its logic |
+| fastapi-template | — | `backend` + `frontend` | frontend/backend pairs are two components, not one repo |
+| apache/airflow | **crash** | scored | a member entry of `"."` is the repository's business, not a reason to fail it |
+| heroku/node-js-getting-started | rejected as a library | runnable | the library-entry rule needs the package to actually be *consumed* — this one is `private: true` and CRUCIBLE runs it end to end |
+
+### Two label corrections, both stated
+
+`micronaut-examples` is archived and contains only README.md — reporting zero
+workspaces was correct and the `java/monorepo` label was factually wrong;
+replaced with `apache/camel`. `vuejs/core` carried `max_runnable=0`, but
+`packages-private/sfc-playground` is a genuinely runnable playground;
+"framework repository" and "contains nothing runnable" are different claims.
+Both corrections are recorded in `bench/corpus.py` with their reasons.
+
+## 10. Threat model
+
+`THREAT_MODEL.md`, checked by `security/tm_check.py`, which fails if a claim
+names a test that does not exist. 16 claims: **11 with resolving evidence, 5
+UNVERIFIED by name**. The first draft failed its own checker on 14 of 16.
+
+## 11. Honest maturity label
 
 **Working prototype with a verified execution path on four ecosystems.**
 
