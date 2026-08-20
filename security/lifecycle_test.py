@@ -200,6 +200,74 @@ def run_case(name: str, spec: dict, reap_with_run: bool) -> dict:
     }
 
 
+def case_bystander() -> dict:
+    """A live run must survive a reap. This is the dangerous direction.
+
+    Cleanup that is merely aggressive passes every leak test and destroys
+    production. Here a healthy run is in flight, holding a cgroup, mounts and
+    a pod, while reap() executes -- twice, because repeated cleanup has to be
+    safe too. Its resources must be untouched and it must still succeed.
+    """
+    wipe()
+    proc, log = start_engine()
+    if not wait_for(pod_is_up, timeout=180):
+        proc.kill(); log.close()
+        return {"case": "bystander", "outcome": "setup_failed",
+                "detail": "run never reached the pod phase"}
+
+    before = inventory()
+    victim_cgroups = {k: v for k, v in before["cgroups"].items() if v}
+    rep1 = lifecycle.reap(STATE_ROOT, log=lambda *_: None)
+    rep2 = lifecycle.reap(STATE_ROOT, log=lambda *_: None)   # idempotent?
+    after = inventory()
+
+    harmed = []
+    for name, members in victim_cgroups.items():
+        still = set(lifecycle.cgroup_members(name))
+        gone = [p for p in members if p not in still]
+        if name not in after["cgroups"]:
+            harmed.append(f"reaper deleted the live run's cgroup {name}")
+        elif gone:
+            harmed.append(f"reaper killed live pids {gone} in {name}")
+    for mp in before["overlay_mounts"]:
+        if mp not in after["overlay_mounts"]:
+            harmed.append(f"reaper unmounted the live run's {mp}")
+
+    rc = proc.wait(timeout=300)
+    log.close()
+    out = Path("/tmp/lifecycle-run.log").read_text(errors="replace")
+    survived_ok = "SUCCESS" in out
+    if not survived_ok:
+        harmed.append(f"the live run did not complete (rc={rc})")
+    if rep1.processes_killed or rep2.processes_killed:
+        harmed.append(f"reap killed {rep1.processes_killed}+{rep2.processes_killed} "
+                      f"processes while a run was healthy")
+
+    return {"case": "bystander", "why": "reap twice while a healthy run is live",
+            "outcome": "clean" if not harmed else "LEAKED",
+            "survived_crash": [], "after_recovery": harmed,
+            "reaped": f"skipped_live={rep1.skipped_live}, "
+                      f"second pass reaped {rep2.runs_reaped}"}
+
+
+def case_double_reap() -> dict:
+    """Reaping an already-clean environment must be a no-op, not an error."""
+    wipe()
+    a = lifecycle.reap(STATE_ROOT, log=lambda *_: None)
+    b = lifecycle.reap(STATE_ROOT, log=lambda *_: None)
+    bad = []
+    if a.anything() or b.anything():
+        bad.append(f"reap acted on an empty environment: {a.summary()} / {b.summary()}")
+    if leaked(inventory()):
+        bad.append("wipe left state behind")
+    return {"case": "double_reap", "why": "repeated cleanup is safe",
+            "outcome": "clean" if not bad else "LEAKED",
+            "survived_crash": [], "after_recovery": bad, "reaped": "no-op"}
+
+
+EXTRA = {"bystander": case_bystander, "double_reap": case_double_reap}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="lifecycle_test")
     ap.add_argument("--case", default="all")
@@ -211,10 +279,10 @@ def main() -> int:
     if os.geteuid() != 0:
         sys.exit("must run as root (mounts and cgroups)")
 
-    names = list(CASES) if a.case == "all" else [a.case]
+    names = (list(CASES) + list(EXTRA)) if a.case == "all" else [a.case]
     results = []
     for n in names:
-        res = run_case(n, CASES[n], a.reap_with_run)
+        res = EXTRA[n]() if n in EXTRA else run_case(n, CASES[n], a.reap_with_run)
         results.append(res)
         mark = {"clean": "✓", "LEAKED": "✗"}.get(res["outcome"], "!")
         print(f"{mark} {n:16} {res['outcome']:12} {res.get('why', '')}")
