@@ -37,10 +37,11 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import evidence as ev_mod
+from . import lifecycle
 from . import lint as lint_mod
 from . import planner as planner_mod
 from . import repair as repair_mod
-from .backends.namespace import NamespaceBackend
+from .backends.namespace import STATE_ROOT, NamespaceBackend
 from .oracle import Verdict, verify
 from .schema import Evidence, ExecResult, RunPlan, Step
 
@@ -188,15 +189,25 @@ class Engine:
         plan, cache_hit = self._seed_plan(ev, efp, prefer)
         self._lint(plan, ev)
 
-        # Cleanup after a crash cannot be the crashing process's job.
+        # Cleanup after a crash cannot be the crashing process's job, so a
+        # later run does it -- but only for runs it can prove are gone.
         from .backends.namespace import reap_abandoned
         try:
+            lifecycle.reap(STATE_ROOT, self.log)
             reap_abandoned(self.log)
         except OSError as e:
             self.log(f"  ! reaper: {e}")
         box = self.backend_cls(f"box-{uuid.uuid4().hex[:8]}", log=self.log, mem_mb=self.mem_mb,
                                store_mb=self.store_mb)
         box.dns = dns
+
+        # Declare ownership before creating anything. A record written after
+        # the fact is a record the crash happens before.
+        registry = lifecycle.Registry(STATE_ROOT)
+        run_id = box.id
+        record = registry.open(run_id, cgroup=getattr(box, "cgroup", ""))
+        record.dirs = [str(box.dir)]
+        registry.write(record)
 
         out = Outcome(False, plan, efp, cache_hit=cache_hit)
         tried: set[str] = set()
@@ -301,6 +312,18 @@ class Engine:
         finally:
             box.destroy()
             dns.stop()
+            # Belt and braces: the graceful teardown above should already have
+            # released everything, so this normally kills zero processes. It
+            # exists for the paths where it does not -- a sidecar that ignored
+            # SIGKILL, a mount that was busy -- and it is exact, because
+            # membership came from the kernel.
+            left = lifecycle.cgroup_kill(record.cgroup) if record.cgroup else 0
+            if left:
+                self.log(f"  \033[33m! {left} process(es) survived teardown; "
+                         f"cgroup.kill released them\033[0m")
+            if record.cgroup:
+                lifecycle.cgroup_remove(record.cgroup)
+            registry.close(run_id)
 
         out.ledger = Ledger(
             hostnames=dns.hostnames,
@@ -356,7 +379,8 @@ class Engine:
         pod = None
         if plan.services:
             from .pod import Pod
-            pod = Pod(f"pod-{uuid.uuid4().hex[:8]}", log=self.log)
+            pod = Pod(f"pod-{uuid.uuid4().hex[:8]}", log=self.log,
+                      cgroup=getattr(box, "cgroup", ""))
             pod.start()
             for svc in plan.services:
                 rs = pod.launch(svc)

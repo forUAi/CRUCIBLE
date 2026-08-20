@@ -126,12 +126,22 @@ class RunningService:
 
 
 class Pod:
-    def __init__(self, pod_id: str, log=print):
+    def __init__(self, pod_id: str, log=print, cgroup: str = ""):
         self.id = pod_id
         self.log = log
         self.dir = STATE_ROOT / "pods" / pod_id
         self.pause: Optional[subprocess.Popen] = None
         self.services: list[RunningService] = []
+        # The run's cgroup. Every process the pod starts joins it, so a later
+        # run can terminate exactly these and nothing else even if this one is
+        # SIGKILLed before down() runs. Without it the pause container --
+        # `sleep 86400` holding the netns -- orphans to init and stays there.
+        self.cgroup = cgroup
+
+    def _adopt(self, pid: int) -> None:
+        if self.cgroup:
+            from .lifecycle import cgroup_attach
+            cgroup_attach(self.cgroup, pid)
 
     # ------------------------------------------------------------------
 
@@ -147,6 +157,7 @@ class Pod:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             preexec_fn=os.setsid,
         )
+        self._adopt(self.pause.pid)
         time.sleep(0.25)
         self._in_ns(["python3", "-c", _LO_UP])
         self.log(f"  pod netns {self._ns_id()} up (egress cut, loopback live)")
@@ -207,6 +218,7 @@ class Pod:
              "chroot", str(merged), "/bin/sh", "/.crucible-svc.sh"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             preexec_fn=os.setsid)
+        self._adopt(proc.pid)
         rs = RunningService(svc.name, proc, merged, port)
         self.services.append(rs)
         return rs
