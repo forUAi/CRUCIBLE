@@ -159,6 +159,24 @@ class Engine:
 
     # ------------------------------------------------------------------
 
+    def _require_cgroup(self, box) -> str:
+        """A backend without an ownership boundary cannot be cleaned up after.
+
+        This was `getattr(box, "cgroup", "")`, and when the property went
+        missing during an edit the default silently turned ownership tracking
+        off: the pod's pause container joined nothing, the crash suite found
+        it orphaned, and the only symptom was a leak. A missing boundary is a
+        defect, not a degraded mode.
+        """
+        cg = getattr(box, "cgroup", None)
+        if not cg:
+            if not getattr(box, "supports_snapshots", True):
+                return ""            # a stub backend that owns nothing
+            raise RuntimeError(
+                f"{type(box).__name__} exposes no cgroup; processes it starts "
+                f"could not be reclaimed after a crash")
+        return cg
+
     def _lint(self, plan: RunPlan, ev: Evidence) -> None:
         """Check the plan against its own evidence before building a sandbox.
 
@@ -205,7 +223,7 @@ class Engine:
         # the fact is a record the crash happens before.
         registry = lifecycle.Registry(STATE_ROOT)
         run_id = box.id
-        record = registry.open(run_id, cgroup=getattr(box, "cgroup", ""))
+        record = registry.open(run_id, cgroup=self._require_cgroup(box))
         record.dirs = [str(box.dir)]
         registry.write(record)
 
@@ -380,7 +398,7 @@ class Engine:
         if plan.services:
             from .pod import Pod
             pod = Pod(f"pod-{uuid.uuid4().hex[:8]}", log=self.log,
-                      cgroup=getattr(box, "cgroup", ""))
+                      cgroup=self._require_cgroup(box))
             pod.start()
             for svc in plan.services:
                 rs = pod.launch(svc)

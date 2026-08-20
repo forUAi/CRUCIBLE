@@ -54,3 +54,45 @@ class TestBackendContract(unittest.TestCase):
         mb = default_store_mb(floor=4096, ceiling=65536)
         self.assertGreaterEqual(mb, 4096)
         self.assertLessEqual(mb, 65536)
+
+
+class TestOwnershipBoundary(unittest.TestCase):
+    """The cgroup is how a later run proves which processes were abandoned.
+
+    It went missing once during an edit and `getattr(box, "cgroup", "")`
+    turned that into silence: the pod's pause container joined nothing and
+    orphaned to init. A missing boundary must fail loudly.
+    """
+
+    def test_backend_exposes_a_cgroup_name(self):
+        box = NamespaceBackend.__new__(NamespaceBackend)
+        box.id = "box-deadbeef"
+        self.assertEqual("crucible-box-deadbeef", box.cgroup)
+
+    def test_engine_refuses_a_backend_without_one(self):
+        from crucible.engine import Engine
+
+        class NoOwnership:
+            supports_snapshots = True
+
+        eng = Engine(log=lambda *_: None)
+        with self.assertRaises(RuntimeError) as cm:
+            eng._require_cgroup(NoOwnership())
+        self.assertIn("cgroup", str(cm.exception))
+
+    def test_pod_adopts_into_the_run_cgroup(self):
+        from crucible.pod import Pod
+        seen = []
+        pod = Pod("pod-test", log=lambda *_: None, cgroup="crucible-box-test")
+        import crucible.lifecycle as L
+        real = L.cgroup_attach
+        try:
+            L.cgroup_attach = lambda name, pid: seen.append((name, pid)) or True
+            pod._adopt(4242)
+        finally:
+            L.cgroup_attach = real
+        self.assertEqual([("crucible-box-test", 4242)], seen)
+
+    def test_pod_without_a_cgroup_adopts_nothing(self):
+        from crucible.pod import Pod
+        Pod("pod-test", log=lambda *_: None, cgroup="")._adopt(1)

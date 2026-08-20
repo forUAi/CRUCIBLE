@@ -591,6 +591,15 @@ cd /workspace/{step.cwd.strip('./') or '.'} 2>/dev/null || cd /workspace
         except (ValueError, OSError):
             pass
 
+    @property
+    def cgroup(self) -> str:
+        """The cgroup that owns every process this box starts.
+
+        Part of the backend contract, not an optional extra: it is how a later
+        run proves which processes belong to an abandoned one.
+        """
+        return f"crucible-{self.id}"
+
     def _cgroup_setup(self) -> None:
         v2 = Path("/sys/fs/cgroup/cgroup.controllers")
         try:
